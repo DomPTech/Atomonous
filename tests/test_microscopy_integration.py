@@ -17,7 +17,7 @@ def microscope_setup():
     settings.autoscript_port = 9001
     
     print("\n--- Initializing Microscope Test Environment ---")
-    start_res = start_server(mode="mock", servers=[MicroscopeServer.Central, MicroscopeServer.AS])
+    start_res = start_server(mode="mock", servers=[MicroscopeServer.Central, "MicroscopeServer.AS", "Ceos"])
     print(f"Start Server: {start_res}")
     
     time.sleep(1) # Give servers time to bind
