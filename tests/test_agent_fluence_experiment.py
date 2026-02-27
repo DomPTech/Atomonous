@@ -8,15 +8,18 @@ from app.config import settings
 settings.hf_cache_dir = "/lustre/isaac24/scratch/dpelaia/hf_cache/"
 from app.agent.core import Agent
 from app.tools.microscopy import *
+from app.utils.server_cli import show_interactive_server_commands
 
-settings.instrument_host = "10.46.217.241"
-settings.instrument_port = 9095
-settings.autoscript_port = 9091
+# settings.instrument_host = "10.46.217.241"
+# settings.instrument_port = 9095
+# settings.autoscript_port = 9091
 
-start_server(mode="mock")
-time.sleep(1)
-connect_client()
-time.sleep(1)
+# start_server(mode="mock")
+# time.sleep(1)
+# connect_client()
+# time.sleep(1)
+
+show_interactive_server_commands()
 
 prompt = '''
 Please run the following experiment on the real microscope (use real servers):

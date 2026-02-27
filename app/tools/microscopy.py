@@ -174,7 +174,7 @@ def connect_client(host: Optional[str] = None, port: Optional[int] = None) -> st
         
         # Configure routing on the central server
         resp = CLIENT.send_command("Central", "set_routing_table", routing_table)
-        if isinstance(resp, str) and "ERROR" in resp:
+        if resp is None or (isinstance(resp, str) and ("error" in resp.lower() or "failed" in resp.lower())):
             return f"Failed to set routing table: {resp}"
         
         # Initialize AS server
@@ -182,7 +182,7 @@ def connect_client(host: Optional[str] = None, port: Optional[int] = None) -> st
             "host": settings.instrument_host, 
             "port": settings.instrument_port
         })
-        if isinstance(as_resp, str) and "ERROR" in as_resp:
+        if as_resp is None or (isinstance(as_resp, str) and ("error" in as_resp.lower() or "failed" in as_resp.lower())):
             return f"Failed to reach AS server: {as_resp}. Did you start all servers?"
         
         return f"Connected successfully. Routing: {resp}, AS: {as_resp}"
