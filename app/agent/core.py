@@ -129,15 +129,38 @@ class Agent:
         """
         Process user input and return a response.
         """
-        prompt = (
+        import os
+        import re
+
+        def _generate_until_success(prompt_text: str) -> str:
+            current_prompt = prompt_text
+            while True:
+                print("\\nAgent is working on the workflow...")
+                output = str(self.agent.run(current_prompt)).strip()
+                print(f"\\nAgent Output:\\n{output}\\n")
+                
+                # Extract path ending in .yaml avoiding surrounding punctuation
+                match = re.search(r'([/\\w\\.-]+\\.yaml)', output)
+                if match:
+                    path = match.group(1).strip()
+                    if os.path.exists(path):
+                        return path
+                    else:
+                        print(f"Warning: Discovered path '{path}' does not exist on disk. Forcing retry.")
+                        current_prompt = f"The path you provided ({path}) does not exist. Did you successfully run `design_workflow`? Please try again and provide the correct absolute path."
+                else:
+                    print("Warning: Could not extract a valid .yaml path from output. Forcing retry.")
+                    current_prompt = "You did not provide a valid .yaml file path. You MUST use the `design_workflow` tool and output the resulting absolute path."
+
+        init_prompt = (
             f"Please design a workflow for the following experimental task:\\n{query}\\n\\n"
-            "You MUST use the `design_workflow` tool to define and save this workflow. Provide the path of the saved yaml file as your final answer."
+            "You MUST use the `design_workflow` tool to define and save this workflow. Provide the absolute path of the saved yaml file as your final answer."
         )
-        print("Agent is designing the workflow...")
-        yaml_path = str(self.agent.run(prompt)).strip()
-        print(f"\\nAgent Output: {yaml_path}\\n")
+        
+        parsed_yaml_path = _generate_until_success(init_prompt)
         
         while True:
+            print(f"\\nProposed Workflow YAML: {parsed_yaml_path}")
             print("Options:")
             print("1. Accept workflow and execute")
             print("2. Modify workflow")
@@ -145,20 +168,11 @@ class Agent:
             choice = input("Enter your choice (1/2/3): ").strip()
             
             if choice == '1':
-                # Try to extract yaml path if it returned a complex string
-                import re
-                match = re.search(r'([/\\w\\.-]+\\.yaml)', yaml_path)
-                if match:
-                    parsed_yaml_path = match.group(1)
-                else:
-                    parsed_yaml_path = input("Could not safely extract yaml path. Please enter the path to the .yaml file manually: ").strip()
                 break
             elif choice == '2':
                 mod_query = input("Enter your modifications: ")
-                mod_prompt = f"Please modify the previously designed workflow as follows: {mod_query}\\nUse design_workflow to save it."
-                print("Agent is modifying the workflow...")
-                yaml_path = str(self.agent.run(mod_prompt)).strip()
-                print(f"\\nAgent Output: {yaml_path}\\n")
+                mod_prompt = f"Please modify the previously designed workflow as follows: {mod_query}\\nUse `design_workflow` to save it and return the updated absolute path."
+                parsed_yaml_path = _generate_until_success(mod_prompt)
             elif choice == '3':
                 return "Execution canceled by user."
             else:
@@ -180,7 +194,18 @@ class Agent:
             # Use context to pass the LLM in so CodeNodes can wake the Agent up.
             final_state = executor.run(context={"agent": self.agent})
             
-            return f"Workflow {template.name} execution finished.\\nHistory: {final_state.history}\\nErrors: {final_state.errors}\\nMetrics: {final_state.metrics}"
+            print("\\nAgent is generating a summary of the execution...")
+            summary_prompt = (
+                f"The workflow '{template.name}' has finished executing.\\n"
+                f"State Data: {final_state.data}\\n"
+                f"History: {final_state.history}\\n"
+                f"Errors: {final_state.errors}\\n"
+                f"Metrics: {final_state.metrics}\\n"
+                "Please provide a brief, user-friendly summary of what was accomplished."
+            )
+            summary = str(self.agent.run(summary_prompt)).strip()
+            
+            return f"Workflow {template.name} execution finished.\\n\\nSummary:\\n{summary}\\n\\nHistory: {final_state.history}\\nErrors: {final_state.errors}\\nMetrics: {final_state.metrics}"
         except Exception as e:
             return f"Failed to execute workflow: {e}"
 
