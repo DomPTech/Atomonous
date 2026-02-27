@@ -729,8 +729,10 @@ def design_workflow(name: str, yaml_content: str) -> str:
     Designs a new experimental workflow by parsing a YAML configuration,
     validating it, and saving it as an executable .yaml file and a .png diagram.
     The AI should output the YAML content as a string.
-    Use a CodeNode for any complex logic (like for/while loops), special imports,
-    or calculations that the agent needs to perform during execution.
+    
+    CRITICAL: You MUST use a `CodeNode` for any logic that requires iteration (like for/while loops). 
+    - WRONG: Creating individual `MicroscopeTool` nodes to iterate over values (e.g. 'set_current_10', 'set_current_20').
+    - RIGHT: Create a single `CodeNode` with a description that explains the loop (e.g. 'Loop over beam currents [10, 20, 30]... for each value, set current, tune, and acquire tableau').
     
     Args:
         name: Name of the workflow file (e.g., 'focus_optimization'). It will be saved as app/workflows/{name}.yaml

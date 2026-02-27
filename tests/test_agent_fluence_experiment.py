@@ -16,6 +16,7 @@ settings.autoscript_port = 9091
 start_server(mode="mock")
 time.sleep(1)
 connect_client()
+time.sleep(1)
 
 prompt = '''
 Please run the following experiment on the real microscope (use real servers):

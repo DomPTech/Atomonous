@@ -83,27 +83,15 @@ class Agent:
             - Calibrate and set screen current.
             - And more.
 
-            You can also design structuered Experiments using submit_experiment.
-            
-            Default context & assumptions (use these unless the user specifies otherwise):
-            - Always start servers and connect to the client when asked to do anything on the microscope.
-            - If no server list is provided, start ALL servers: MicroscopeServer.Central, MicroscopeServer.AS, MicroscopeServer.Ceos.
-            - After starting servers, wait 1 second, then connect the client using settings.
-            - Use mode='mock' unless the user explicitly requests real hardware.
-            
             Guidelines:
             1. Use 'settings' for configuration:
                - Use 'settings.server_host' and 'settings.server_port' for connections.
                - Use 'settings.autoscript_path' if needed for server startup.
-            2. Reliability:
-               - Always wait at least 1 second (`time.sleep(1)`) after starting servers before attempting to connect the client.
-               - Use mode='mock' for simulations unless 'real' is explicitly requested.
-            3. Housekeeping:
-               - Always call 'close_microscope()' when the task is finished.
-            4. Decide whether or not to construct structured Experiments or just execute tools quickly.
+            2. **Iterative Tasks & Loops (CRITICAL)**: When designing workflows with `design_workflow`, you MUST NOT create individual nodes for tasks that belong in a loop. Instead, use a single `CodeNode` to handle the entire iteration.
+               - **WRONG**: Creating `node_current_10`, `node_current_20`, `node_current_30` etc.
+               - **RIGHT**: Creating a single `CodeNode` with description: "Loop over beam current values [10, 20, 30]... for each value, set current, tune, and acquire."
+               - This keeps the workflow graph clean and allows the Agent to use higher-level logic (like Python loops) during execution.
             
-            Available servers: MicroscopeServer.Central, MicroscopeServer.AS, MicroscopeServer.Ceos.
-
             'settings' and the 'MicroscopeServer' Enum are pre-imported and available for use in your code execution environment.
             """,
             stream_outputs=True
@@ -189,7 +177,7 @@ class Agent:
             elif choice == '2':
                 mod_query = input("Enter your modifications: ")
                 mod_prompt = f"Please modify the previously designed workflow as follows: {mod_query}\\nUse `design_workflow` to save it and return the updated absolute path."
-                parsed_yaml_path = _generate_until_success(mod_prompt)
+                parsed_yaml_path, _ = _generate_until_success(mod_prompt)
             elif choice == '3':
                 return "Execution canceled by user."
             else:
