@@ -227,7 +227,7 @@ def capture_image(detector: str = "Ceta", destination: str = "AS") -> str:
         detector: The detector to use.
         destination: The server to send the command to (default 'AS').
     """
-    global CLIENT
+    global CLIENT, AGENT_INSTANCE
     if not CLIENT:
         return "Error: Client not connected."
         
@@ -247,9 +247,27 @@ def capture_image(detector: str = "Ceta", destination: str = "AS") -> str:
         if isinstance(img, str):
             return f"Failed to capture image. Error from server: {img}"
 
-        output_path = f"/tmp/microscope_capture_{int(time.time())}.npy"
-        np.save(output_path, img)
-        return f"Image captured from {destination} and saved to {output_path} (Shape: {img.shape})"
+        # Save to session memory if agent has one, otherwise to /tmp
+        output_path = f"microscope_capture_{int(time.time())}.npy"
+        full_path = None
+        
+        try:
+            if (AGENT_INSTANCE and 
+                hasattr(AGENT_INSTANCE, 'memory') and 
+                AGENT_INSTANCE.memory and 
+                hasattr(AGENT_INSTANCE.memory, 'session_dir')):
+                from pathlib import Path
+                session_dir = AGENT_INSTANCE.memory.session_dir
+                full_path = str(Path(session_dir) / output_path)
+        except (AttributeError, TypeError):
+            pass
+        
+        # Fallback to /tmp if memory not available
+        if not full_path:
+            full_path = f"/tmp/{output_path}"
+        
+        np.save(full_path, img)
+        return f"Image captured from {destination} and saved to {full_path} (Shape: {img.shape})"
     except Exception as e:
         return f"Error capturing image: {e}"
 
@@ -516,7 +534,7 @@ def tune_C1A1(destination: str = "AS") -> str:
         return f"Error tuning C1A1: {e}"
 
 @tool
-def acquire_tableau(tab_type: str = "Fast", angle: float = 18.0) -> Any:
+def acquire_tableau(tab_type: str = "Fast", angle: float = 18.0) -> dict:
     """
     Acquires a tableau from the CEOS server.
     
@@ -530,7 +548,7 @@ def acquire_tableau(tab_type: str = "Fast", angle: float = 18.0) -> Any:
     
     try:
         tableau_data = CLIENT.send_command("Ceos", "acquireTableau", {"tabType": tab_type, "angle": angle})
-        return json.dumps(tableau_data)
+        return tableau_data
     except Exception as e:
         return f"Error acquiring tableau: {e}"
 
@@ -646,20 +664,12 @@ class CodeNode(WorkflowNode):
             print(f"  -> [CodeNode '{self.name}'] Unpausing Agent to solve task: {description}")
             try:
                 state.history.append(f"Executing CodeNode '{self.name}' via LLM Agent task")
-                # Inject state into agent's python executor so it can interact with the workflow
-                if hasattr(agent, "python_executor"):
-                    try:
-                        agent.python_executor.send_variables({"state": state})
-                    except Exception:
-                        pass
                 
                 # Command the agent to fulfill the description
                 prompt = (
                     f"You are executing an already-designed workflow step named '{self.name}'.\\n"
                     f"Your core task is: {description}\\n\\n"
-                    "The current workflow `state` object (type WorkflowState) has been injected into your python_executor local variables.\\n"
-                    "Read `state.data` or perform standard tool calls to satisfy the request.\\n"
-                    "If you determine new data, you can assign it like `state.data['new_key'] = val`.\\n"
+                    "Execute the task using available tools and code execution.\\n"
                     "Provide a brief summary of what you did when you are finished."
                 )
                 
@@ -734,8 +744,7 @@ def get_last_created_workflow() -> Optional[str]:
 @tool
 def design_workflow(name: str, yaml_content: str) -> str:
     """
-    Designs a new experimental workflow by parsing a YAML configuration,
-    validating it, and saving it as an executable .yaml file and a .png diagram.
+    Designs a new experimental workflow by parsing and validating a YAML configuration.
     The AI should output the YAML content as a string.
     
     CRITICAL: You MUST use a `CodeNode` for any logic that requires iteration (like for/while loops). 
@@ -743,93 +752,20 @@ def design_workflow(name: str, yaml_content: str) -> str:
     - RIGHT: Create a single `CodeNode` with a description that explains the loop (e.g. 'Loop over beam currents [10, 20, 30]... for each value, set current, tune, and acquire tableau').
     
     Args:
-        name: Name of the workflow file (e.g., 'focus_optimization'). It will be saved as app/workflows/{name}.yaml
+        name: Name of the workflow (e.g., 'focus_optimization').
         yaml_content: The full YAML string defining the workflow. It must have 'name', 'description', 
                       'nodes' (list of dicts with 'id', 'type', 'params'), and 
                       'edges' (list of dicts with 'source' and 'target'). Types can be 'MicroscopeTool' 
                       (params: 'tool', 'args'), 'AIContext' (params: 'query'), 'AIQuality' (params: 'evaluate_node'),
                       or 'CodeNode' (params: 'description').
     """
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    workflows_dir = os.path.join(base_dir, "workflows")
-    os.makedirs(workflows_dir, exist_ok=True)
-               
-    yaml_path = os.path.join(workflows_dir, f"{name}.yaml")
-    png_path = os.path.join(workflows_dir, name) # Graphviz auto appends .png if told to format
     
     try:
         parsed_yaml = yaml.safe_load(yaml_content)
         # Validate through Pydantic
         template = WorkflowTemplate(**parsed_yaml)
         
-        # Save yaml
-        with open(yaml_path, 'w') as f:
-            f.write(yaml_content)
-
-        # Register state so external callers (LLM bridge) can detect the created workflow
-        try:
-            register_workflow_created(yaml_path)
-        except Exception:
-            pass
-
-        # Generate Graphviz chart
-        dot = graphviz.Digraph(comment=template.name)
-        dot.attr(rankdir='TB', splines='spline', nodesep='0.6', ranksep='0.8', bgcolor='#121212')
-        dot.attr('edge', fontname='Helvetica,Arial,sans-serif', fontsize='10', color='#888888', arrowsize='0.8')
-        
-        for node in template.nodes:
-            node_id = str(node['id'])
-            node_type = node.get('type', 'Unknown')
-            params = node.get('params', {})
-            
-            # Distinct colors per node type
-            if node_type == 'MicroscopeTool':
-                border_color = '#00FF9D'
-                bg_color = '#002E1C'
-            elif node_type == 'AIContext':
-                border_color = '#00D1FF'
-                bg_color = '#001A24'
-            elif node_type == 'AIQuality':
-                border_color = '#FF9900'
-                bg_color = '#2E1A00'
-            elif node_type == 'CodeNode':
-                border_color = '#FF00FF'
-                bg_color = '#2A002A'
-            else:
-                border_color = '#999999'
-                bg_color = '#222222'
-
-            # Build HTML-like label showing the function / params
-            html_rows = f'<TR><TD ALIGN="CENTER" BORDER="0" CELLPADDING="8"><B><FONT COLOR="{border_color}" POINT-SIZE="16">{node_id}</FONT></B></TD></TR>'
-            html_rows += f'<TR><TD ALIGN="CENTER" BORDER="0" CELLPADDING="2"><FONT COLOR="#AAAAAA" POINT-SIZE="11">{node_type}</FONT></TD></TR>'
-            
-            # Add parameters if they exist
-            if params:
-                for k, v in params.items():
-                    val_str = str(v)[:40] + '...' if len(str(v)) > 40 else str(v)
-                    html_rows += f'<TR><TD ALIGN="LEFT" BORDER="0" CELLPADDING="4"><FONT COLOR="#CCCCCC" POINT-SIZE="10"><B>{k}:</B> {val_str}</FONT></TD></TR>'
-
-            label = f'<<TABLE BORDER="1" COLOR="{border_color}" CELLBORDER="0" CELLSPACING="0" CELLPADDING="8" BGCOLOR="{bg_color}" STYLE="ROUNDED">{html_rows}</TABLE>>'
-
-            if node_id in ['__start__', '__end__', 'start', 'end']:
-                dot.node(node_id, node_id, shape='ellipse', style='filled,rounded', fillcolor='#333333', color='#888888', fontcolor='#FFFFFF', fontname='Helvetica,Arial,sans-serif')
-            else:
-                dot.node(node_id, label, shape='none', margin='0')
-            
-        for edge in template.edges:
-            edge_kwargs = {}
-            if 'style' in edge:
-                edge_kwargs['style'] = str(edge['style'])
-            if 'label' in edge:
-                label_text = str(edge['label'])
-                edge_kwargs['label'] = f'<<TABLE BORDER="0" CELLBORDER="1" COLOR="#333333" CELLPADDING="4" BGCOLOR="#222222"><TR><TD><FONT COLOR="#FFFFFF" POINT-SIZE="10">{label_text}</FONT></TD></TR></TABLE>>'
-                
-            dot.edge(str(edge['source']), str(edge['target']), **edge_kwargs)
-            
-        # Render
-        dot.render(png_path, format='png', cleanup=True)
-        
-        return f"Successfully designed workflow! Saved YAML to {yaml_path} and diagram to {png_path}.png. Please ask the user to approve the workflow before calling execute_workflow."
+        return f"Successfully designed workflow '{name}'! Workflow is valid and ready to execute. Please ask the user to approve the workflow before calling execute_workflow."
     except Exception as e:
         return f"Failed to design workflow: {str(e)}"
 

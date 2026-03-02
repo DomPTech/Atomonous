@@ -38,6 +38,5 @@ venv.bak/
 .vscode/
 .idea/
 
-# Workflow files
-app/workflows/*.yaml
-app/workflows/*.png
+# Artifacts
+artifacts/

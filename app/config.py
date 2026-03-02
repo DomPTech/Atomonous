@@ -44,6 +44,9 @@ class MicroscopeSettings(BaseSettings):
     # Agent Approval Control
     agent_autorun: bool = Field(False, description="If True, allow agent to execute tools without requiring manual approval. If False, each tool call requires user confirmation.")
 
+    # Artifact & Memory Storage
+    artifacts_dir: str = Field("./artifacts", description="Base directory for saving session artifacts (workflows, images, chat history, execution steps).")
+
     # Other stuff
     hf_cache_dir: str = Field("~/.cache/huggingface", description="To configure where Huggingface will locally store data, models, etc.")
 
