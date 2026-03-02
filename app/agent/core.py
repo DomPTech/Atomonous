@@ -18,6 +18,7 @@ from smolagents import CodeAgent, TransformersModel, DuckDuckGoSearchTool
 from smolagents.models import ChatMessageStreamDelta
 from app.tools.microscopy import TOOLS, MicroscopeServer
 from app.utils.helpers import get_total_ram_gb
+from app.utils.memory import SessionMemory
 from app.agent.supervised_executor import SupervisedExecutor
 try:
     import pyTEMlib.probe_tools as pt
@@ -94,10 +95,16 @@ class MicroscopeClientProxy:
         return getattr(microscopy.CLIENT, name)
 
 class Agent:
-    def __init__(self, model_id: str = "Auto"):
+    def __init__(self, model_id: str = "Auto", session_name: str = ""):
         ram_gb = get_total_ram_gb()
         load_in_8bit = False
         low_cpu_mem_usage = True
+
+        # Initialize session memory
+        self.memory = SessionMemory(
+            artifacts_base_dir=settings.artifacts_dir,
+            session_name=session_name
+        )
 
         # Auto-select model based on available RAM
         if model_id == "Auto" or not model_id:
@@ -164,8 +171,8 @@ class Agent:
             stream_outputs=True
         )
 
-        # Inject agent instance for workflow execution
-        microscopy.AGENT_INSTANCE = self.agent
+        # Inject agent instance for workflow execution (self = Agent wrapper with memory)
+        microscopy.AGENT_INSTANCE = self
 
         # Preload common classes into the Python executor context
         try:
@@ -326,10 +333,29 @@ class Agent:
             template = WorkflowTemplate(**parsed_template_yaml)
             executor = WorkflowExecutor(template, NODE_REGISTRY)
             
+            # Save workflow YAML and PNG to memory BEFORE execution starts
+            try:
+                png_path = Path(parsed_yaml_path).parent / (Path(parsed_yaml_path).stem + ".png")
+                png_path_str = str(png_path) if png_path.exists() else None
+                self.memory.save_workflow(parsed_yaml_path, png_path_str)
+            except Exception as e:
+                print(f"[Agent] Warning: Failed to save workflow files: {e}")
+            
             print(f"\\n--- Initiating Workflow: {template.name} ---\\n")
             
             # Use context to pass the Agent wrapper so CodeNodes can call run_subagent
             final_state = executor.run(context={"agent": self})
+            
+            # Save execution steps AFTER workflow completes
+            try:
+                self.memory.save_execution_steps(
+                    history=final_state.history,
+                    errors=final_state.errors,
+                    metrics=final_state.metrics,
+                    summary=""
+                )
+            except Exception as e:
+                print(f"[Agent] Warning: Failed to save execution steps: {e}")
             
             print("\\nAgent is generating a summary of the execution...")
             summary_prompt = (
