@@ -21,15 +21,19 @@ import torch
 from smolagents import CodeAgent, TransformersModel, ActionStep
 from smolagents.models import ChatMessageStreamDelta, ChatMessage
 
-from app.tools.microscopy import TOOLS, NODE_REGISTRY, MicroscopeServer, WorkflowTemplate, WorkflowExecutor
+from app.tools import microscopy
+from app.tools.microscopy import TOOLS, NODE_REGISTRY, MicroscopeServer, WorkflowTemplate, WorkflowExecutor, get_last_created_workflow
 from app.utils.helpers import get_total_ram_gb
 from app.utils.memory import SessionMemory
 from app.agent.supervised_executor import SupervisedExecutor
+from app.config import settings
 
 import pyTEMlib.probe_tools as pt
 
-from app.tools import microscopy
-from app.config import settings
+
+class WorkflowCreated(Exception):
+    """Raised when a workflow is successfully created and should trigger approval flow."""
+    pass
 
 
 def _safe_to_string(value: object) -> str:
@@ -232,6 +236,12 @@ class Agent:
         microscopy.AGENT_INSTANCE = self
 
         # Preload common classes into the Python executor context
+        self._setup_executor_context()
+    
+    def _setup_executor_context(self):
+        """
+        Injects common variables/classes/modules into the Python executor context.
+        """
         try:
             self.agent.python_executor.send_variables({
                 "MicroscopeServer": MicroscopeServer,
@@ -239,6 +249,7 @@ class Agent:
                 "pt": pt,
                 "np": np,
                 "settings": settings,
+                "yaml": yaml,
             })
         except Exception:
             # Non-fatal: some executors may not support variable injection
@@ -280,16 +291,7 @@ class Agent:
             stream_outputs=True
         )
         
-        try:
-            subagent.python_executor.send_variables({
-                "MicroscopeServer": MicroscopeServer,
-                "tem": MicroscopeClientProxy(),
-                "pt": pt,
-                "np": np,
-                "settings": settings,
-            })
-        except Exception:
-            pass
+        self._setup_executor_context()
         
         return str(subagent.run(prompt)).strip()
 
@@ -308,14 +310,14 @@ class Agent:
         if memory_step.code_action and "design_workflow(" in memory_step.code_action:
             # design_workflow was called in this step, check if it completed successfully
             try:
-                workflow_path = microscopy.get_last_created_workflow()
+                workflow_path = get_last_created_workflow()
                 if workflow_path and Path(workflow_path).exists() and workflow_path != self.detected_workflow_path:
                     self.detected_workflow_path = workflow_path
                     # Signal that we should halt and request approval
-                    raise Exception("__WORKFLOW_CREATED__")
-            except Exception as e:
-                if "__WORKFLOW_CREATED__" in str(e):
-                    raise
+                    raise WorkflowCreated()
+            except WorkflowCreated:
+                raise
+            except Exception:
                 pass
 
     @staticmethod
@@ -353,30 +355,38 @@ class Agent:
         # Enable workflow approval detection via step callback
         self.workflow_approval_pending = True
         self.detected_workflow_path = None
+        
+        # Capture baseline to avoid accepting pre-existing workflows from previous requests
+        baseline_workflow_path = None
+        try:
+            baseline_workflow_path = get_last_created_workflow()
+        except Exception:
+            pass
 
         for attempt in range(max_attempts):
             self._emit(emit, "\nAgent is working on the workflow...\n")
             try:
                 last_output = str(self.agent.run(prompt_text)).strip()
+            except WorkflowCreated:
+                # Workflow was detected by step callback
+                if self.detected_workflow_path:
+                    self._emit(emit, f"\n✓ Workflow created at: {self.detected_workflow_path}\n")
+                    self.workflow_approval_pending = False
+                    return self.detected_workflow_path, last_output
             except Exception as e:
-                # Check if this is our workflow creation signal
-                if "__WORKFLOW_CREATED__" in str(e):
-                    # Workflow was detected by step callback
-                    if self.detected_workflow_path:
-                        self._emit(emit, f"\n✓ Workflow created at: {self.detected_workflow_path}\n")
-                        self.workflow_approval_pending = False
-                        return self.detected_workflow_path, last_output
-                else:
-                    # Other exception, log and continue retry loop
-                    last_output = str(e)
-                    self._emit(emit, f"\nAgent error: {e}\n")
+                # Other exception, log and continue retry loop
+                last_output = str(e)
+                self._emit(emit, f"\nAgent error: {e}\n")
             else:
                 self._emit(emit, f"\nAgent Output:\n{last_output}\n")
 
             # Also check if workflow was created (fallback for agents that complete without signal)
             try:
-                yaml_path = microscopy.get_last_created_workflow()
-                if yaml_path and Path(yaml_path).exists() and yaml_path != self.detected_workflow_path:
+                yaml_path = get_last_created_workflow()
+                if (yaml_path and 
+                    Path(yaml_path).exists() and 
+                    yaml_path != self.detected_workflow_path and
+                    yaml_path != baseline_workflow_path):  # Only accept newly created workflows
                     self.detected_workflow_path = yaml_path
                     self.workflow_approval_pending = False
                     return yaml_path, last_output

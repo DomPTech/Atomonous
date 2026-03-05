@@ -30,7 +30,7 @@ Please run the following experiment:
    - Acquire the tableau from Ceos with these arguments: {'tabType':"Fast", 'angle':18}.
    - Compute the probe from the tableau and store results in a list.
    - Break after the first iteration for a quick test run.
-3) Capture one image from AS (size 512) and save it. 
+3) Capture one image from AS (size 512) and save it.
 
 Return a short summary of actions and any saved file paths.
 '''
