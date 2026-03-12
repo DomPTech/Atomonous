@@ -9,14 +9,22 @@ from smolagents import tool
 import Pyro5.api
 import Pyro5.errors
 import numpy as np
+import tango
+from tango.test_context import MultiDeviceTestContext
 from app.config import settings
 from enum import Enum
 import pyTEMlib.probe_tools as pt
 import json
 
+from asyncroscopy.detectors.HAADF import HAADF
+from asyncroscopy.ThermoDigitalTwin import ThermoDigitalTwin
+from asyncroscopy.ThermoMicroscope import ThermoMicroscope
+
 # Global state
-CLIENT: Optional[object] = None # asyncroscopy.clients.notebook_client.NotebookClient
+CLIENT: Optional[object] = None  # tango.DeviceProxy
 SERVER_PROCESSES: Dict[str, subprocess.Popen] = {}
+SERVER_CONTEXT: Optional[MultiDeviceTestContext] = None
+SERVER_DEVICE_NAME: str = "test/nodb/microscope"
 AGENT_INSTANCE: Optional[object] = None  # Set by Agent.__init__() for artifact memory access
 
 def _wait_for_port(host: str, port: int, timeout: float = 10.0) -> bool:
@@ -35,166 +43,86 @@ def _wait_for_port(host: str, port: int, timeout: float = 10.0) -> bool:
             time.sleep(0.2)
     return False
 
-# Define the microscope servers and their twins
-class MicroscopeServer(Enum):
-    Central = {
-        "server": "asyncroscopy.servers.protocols.central_server",
-        "port": 9000
-    }
-    AS = {
-        "server": "asyncroscopy.servers.AS_server",
-        "twin": "asyncroscopy.servers.AS_server_twin",
-        "port": 9001
-    }
-    Ceos = {
-        "server": "asyncroscopy.servers.Ceos_server",
-        "twin": "asyncroscopy.servers.Ceos_server_twin",
-        "port": 9003
-    }
-
 @tool
-def start_server(mode: str = "mock", servers: Optional[list[Union[str, MicroscopeServer]]] = None) -> str:
+def start_server(mode: str = "mock") -> str:
     """
-    Starts the microscope servers (Twisted architecture).
+    Starts asyncroscopy PyTango devices using an in-process test context.
     
     Args:
-        mode: "mock" for testing/simulation (uses twin servers), "real" for actual hardware.
-        servers: List of server modules to start. Can be Enum constants or strings.
-            Example: ["MicroscopeServer.Central", "AS"]. Available options:
-            - MicroscopeServer.Central: The main control server (Port 9000).
-            - MicroscopeServer.AS: The AS server or its twin (Port 9001).
-            - MicroscopeServer.Ceos: The Ceos server or its twin (Port 9003).
-            Defaults to starting all three [Central, AS, Ceos] if None.
+        mode: "mock" for ThermoDigitalTwin (simulation), "real" for ThermoMicroscope.
     """
+    global SERVER_CONTEXT, SERVER_DEVICE_NAME
 
-    global SERVER_PROCESSES
-    if servers is None:
-        servers = [MicroscopeServer.Central, MicroscopeServer.AS, MicroscopeServer.Ceos]
-    else:
-        parsed_servers = []
-        for s in servers:
-            if isinstance(s, MicroscopeServer):
-                parsed_servers.append(s)
-            elif isinstance(s, str):
-                name = s.split('.')[-1] if '.' in s else s
-                try:
-                    parsed_servers.append(MicroscopeServer[name])
-                except KeyError:
-                    return f"Invalid server name: {s}. Valid options: {[e.name for e in MicroscopeServer]}"
-            else:
-                return f"Invalid type for server: {type(s)}. Must be string or MicroscopeServer enum."
-        servers = parsed_servers
+    if SERVER_CONTEXT is not None:
+        return "PyTango asyncroscopy server context already running."
 
-    # If a caller asks for AS/Ceos only, auto-include Central
-    if any(s != MicroscopeServer.Central for s in servers) and MicroscopeServer.Central not in servers:
-        servers = [MicroscopeServer.Central, *servers]
-
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    repo_path = os.path.join(base_dir, "external", "asyncroscopy")
-    
-    env = os.environ.copy()
-    env["PYTHONPATH"] = f"{repo_path}{os.pathsep}{env.get('PYTHONPATH', '')}"
-    env["AUTOSCRIPT_PATH"] = settings.autoscript_path
-
-    started = []
-    ports_to_wait = []
-    
     try:
-        for server in servers:
-            server_name = server.value.get("server")
-            module = server_name
-            port = server.value.get("port")
-            if mode == "mock":
-                module = server.value.get("twin", server_name)
-            
-            # Check if this specific module is already tracked and running
-            if module in SERVER_PROCESSES and SERVER_PROCESSES[module].poll() is None:
-                print(f"Server {module} already running (tracked).")
-                started.append(f"{module} (already running)")
-                continue
+        microscope_cls = ThermoDigitalTwin if mode == "mock" else ThermoMicroscope
+        microscope_name = "test/nodb/microscope"
+        haadf_name = "test/nodb/haadf"
 
-            # Check if something is already listening on the port (might be an orphaned process)
-            if _wait_for_port("localhost", port, timeout=0.2):
-                print(f"Server port {port} already listening. Assuming it's the correct server.")
-                started.append(f"{module} (already listening)")
-                continue
-
-            cmd = [sys.executable, "-m", module, str(port)]
-
-            print(f"Starting server: {module} on port {port}")
-            proc = subprocess.Popen(
-                cmd,
-                cwd=base_dir,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+        microscope_properties = {
+            "haadf_device_address": haadf_name,
+        }
+        if mode == "real":
+            microscope_properties.update(
+                {
+                    "autoscript_host_ip": settings.instrument_host,
+                    "autoscript_host_port": settings.autoscript_port,
+                }
             )
-            SERVER_PROCESSES[module] = proc
-            started.append(module)
-            ports_to_wait.append(port)
-        
-        if not started:
-            return "All requested servers are already running."
 
-        # Wait for newly started servers to be ready
-        if ports_to_wait:
-            print(f"Waiting for servers on ports {ports_to_wait} to be ready...")
-            for port in ports_to_wait:
-                if not _wait_for_port("localhost", port, timeout=10.0):
-                    return f"Failed to start server on port {port} - timeout waiting for it to listen"
-        
-        return f"Servers status: {', '.join(started)} in {mode} mode."
+        devices_info = [
+            {
+                "class": HAADF,
+                "devices": [{"name": haadf_name, "properties": {}}],
+            },
+            {
+                "class": microscope_cls,
+                "devices": [
+                    {
+                        "name": microscope_name,
+                        "properties": microscope_properties,
+                    }
+                ],
+            },
+        ]
 
+        SERVER_CONTEXT = MultiDeviceTestContext(devices_info, process=False)
+        SERVER_CONTEXT.__enter__()
+        SERVER_DEVICE_NAME = microscope_name
+
+        # Smoke check that microscope device is reachable
+        proxy = tango.DeviceProxy(microscope_name)
+        _ = proxy.state()
+
+        return f"Started PyTango asyncroscopy context ({mode}) with devices: {microscope_name}, {haadf_name}."
     except Exception as e:
-        return f"Failed to start servers: {e}"
+        if SERVER_CONTEXT is not None:
+            try:
+                SERVER_CONTEXT.__exit__(None, None, None)
+            except Exception:
+                pass
+            SERVER_CONTEXT = None
+        return f"Failed to start PyTango asyncroscopy context: {e}"
 
 @tool
-def connect_client(host: Optional[str] = None, port: Optional[int] = None) -> str:
+def connect_client() -> str:
     """
-    Connects the client to the central server and sets up routing.
+    Connects a Tango DeviceProxy client to the microscope device.
     
     Args:
-        host: Central server host (defaults to settings.server_host).
-        port: Central server port (defaults to settings.server_port).
+        None.
     """
     global CLIENT
-    from asyncroscopy.clients.notebook_client import NotebookClient
-
-    # Use settings defaults if not provided
-    host = host or settings.server_host
-    port = port or settings.server_port
-
-    # Safety delay to ensure servers are ready
-    time.sleep(1)
-    
-    routing_table = {
-        "Central": ("localhost", MicroscopeServer.Central.value.get("port")),
-        "AS": ("localhost", MicroscopeServer.AS.value.get("port")),
-        "Ceos": ("localhost", MicroscopeServer.Ceos.value.get("port"))
-    }
 
     try:
-        CLIENT = NotebookClient.connect(host=host, port=port)
-        if not CLIENT:
-            return (
-                "FATAL: Failed to connect to central server. "
-                "Ensure start_server() includes MicroscopeServer.Central (or call start_server() with defaults)."
-            )
-        
-        # Configure routing on the central server
-        resp = CLIENT.send_command("Central", "set_routing_table", routing_table)
-        if resp is None or (isinstance(resp, str) and ("error" in resp.lower() or "failed" in resp.lower())):
-            return f"FATAL: Failed to set routing table: {resp}"
-        
-        # Initialize AS server
-        as_resp = CLIENT.send_command("AS", "connect_AS", {
-            "host": settings.instrument_host, 
-            "port": settings.instrument_port
-        })
-        if as_resp is None or (isinstance(as_resp, str) and ("error" in as_resp.lower() or "failed" in as_resp.lower())):
-            return f"FATAL: Failed to reach AS server: {as_resp}. Did you start all servers?"
-        
-        return f"Connected successfully. Routing: {resp}, AS: {as_resp}"
+        if SERVER_CONTEXT is None:
+            return "FATAL: No running PyTango context. Call start_server() first."
+
+        CLIENT = tango.DeviceProxy(SERVER_DEVICE_NAME)
+        state = CLIENT.state()
+        return f"Connected to PyTango microscope client at {SERVER_DEVICE_NAME}. State: {state}"
     except Exception as e:
         CLIENT = None
         return f"FATAL: Connection error: {e}"
@@ -221,33 +149,28 @@ def adjust_magnification(amount: float, destination: str = "AS") -> str:
         return f"Error adjusting magnification: {e}"
 
 @tool
-def capture_image(detector: str = "Ceta", destination: str = "AS") -> str:
+def capture_image(detector: str = "haadf") -> str:
     """
     Captures an image and saves it.
     
     Args:
-        detector: The detector to use.
-        destination: The server to send the command to (default 'AS').
+        detector: The detector to use (e.g., "haadf").
     """
     global CLIENT, AGENT_INSTANCE
     if not CLIENT:
         return "Error: Client not connected."
         
     try:
-        # Twisted servers return numpy arrays wrapped in package_message
-        print(f"[TOOLS DEBUG] Requesting image from {destination}...")
-        img = CLIENT.send_command(destination, "get_scanned_image", {
-            "scanning_detector": detector,
-            "size": 512,
-            "dwell_time": 2e-6
-        })
-        print(f"[TOOLS DEBUG] Received response of type: {type(img)}")
-        
-        if img is None:
-            return "Failed to capture image (None returned)."
-            
-        if isinstance(img, str):
-            return f"Failed to capture image. Error from server: {img}"
+        detector_name = detector.lower().strip()
+        print(f"[TOOLS DEBUG] Requesting image from detector '{detector_name}'...")
+
+        encoded = CLIENT.get_image(detector_name)
+        if encoded is None or len(encoded) != 2:
+            return "Failed to capture image (invalid encoded response)."
+
+        metadata_json, raw_bytes = encoded
+        metadata = json.loads(metadata_json)
+        img = np.frombuffer(raw_bytes, dtype=metadata["dtype"]).reshape(metadata["shape"])
 
         # Save to session memory if agent has one, otherwise to /tmp
         output_path = f"microscope_capture_{int(time.time())}.npy"
@@ -269,16 +192,29 @@ def capture_image(detector: str = "Ceta", destination: str = "AS") -> str:
             full_path = f"/tmp/{output_path}"
         
         np.save(full_path, img)
-        return f"Image captured from {destination} and saved to {full_path} (Shape: {img.shape})"
+        return (
+            f"Image captured from detector '{detector_name}' and saved to {full_path} "
+            f"(Shape: {img.shape}, dtype: {img.dtype})"
+        )
     except Exception as e:
         return f"Error capturing image: {e}"
+
+@tool
+def take_image(detector: str = "haadf") -> str:
+    """
+    Alias for capture_image in the new asyncroscopy API surface.
+
+    Args:
+        detector: Detector name to acquire from (e.g., "haadf").
+    """
+    return capture_image(detector=detector)
 
 @tool
 def close_microscope() -> str:
     """
     Safely closes the microscope connection and stops the servers.
     """
-    global SERVER_PROCESSES, CLIENT
+    global SERVER_PROCESSES, CLIENT, SERVER_CONTEXT
     resp = "Microscope closed."
     
     CLIENT = None
@@ -287,6 +223,15 @@ def close_microscope() -> str:
         proc.terminate()
         resp += f" {module} stopped."
     SERVER_PROCESSES.clear()
+
+    if SERVER_CONTEXT is not None:
+        try:
+            SERVER_CONTEXT.__exit__(None, None, None)
+            resp += " PyTango context stopped."
+        except Exception as e:
+            resp += f" Failed to stop PyTango context cleanly: {e}"
+        finally:
+            SERVER_CONTEXT = None
         
     return resp
 
@@ -571,28 +516,12 @@ def get_atom_count(destination: str = "AS") -> str:
     except Exception as e:
         return f"Error getting atom count: {e}"
 
-# Collection of all tools for the agent
+# Collection of tools for the agent (minimal PyTango surface)
 TOOLS = [
-    adjust_magnification,
-    capture_image,
-    close_microscope,
     start_server,
     connect_client,
-    get_stage_position,
-    calibrate_screen_current,
-    set_beam_current,
-    place_beam,
-    blank_beam,
-    unblank_beam,
-    get_microscope_status,
-    get_microscope_state,
-    set_column_valve,
-    set_optics_mode,
-    discover_commands,
-    get_ceos_info,
-    tune_C1A1,
-    acquire_tableau,
-    get_atom_count,
+    take_image,
+    close_microscope,
 ]
 
 # Workflow Framework Integration

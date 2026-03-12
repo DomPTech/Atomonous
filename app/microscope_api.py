@@ -1,5 +1,6 @@
 from typing import Optional, Dict, Any, Union
 import numpy as np
+import json
 from pydantic import BaseModel, Field, validator
 from app.config import settings
 
@@ -34,20 +35,25 @@ class MicroscopeControl:
     def __init__(self, sim_mode: bool = None):
         self.sim_mode = sim_mode if sim_mode is not None else settings.sim_mode
         self._client = None
+        self._backend = "sim"
         
         if not self.sim_mode:
             self._connect()
 
     def _connect(self):
-        """Connect to the central server if not in simulation mode."""
+        """Connect to the PyTango microscope device if not in simulation mode."""
         try:
-            from asyncroscopy.clients.notebook_client import NotebookClient
-            self._client = NotebookClient(host=settings.server_host, port=9000)
-            # Verify connection or wait for central server
-            print(f"Connected to Central Server at {settings.server_host}:9000")
+            import tango
+
+            device_name = "test/nodb/microscope"
+            self._client = tango.DeviceProxy(device_name)
+            _ = self._client.state()
+            self._backend = "pytango"
+            print(f"Connected to PyTango microscope device at {device_name}")
         except Exception as e:
             print(f"Failed to connect to microscope central server: {e}")
             self.sim_mode = True
+            self._backend = "sim"
 
     def get_stage_position(self, destination: str = "AS") -> StagePosition:
         """Get the current stage position."""
@@ -104,12 +110,13 @@ class MicroscopeControl:
             return ImageResult(data=dummy_data, metadata={"detector": detector, "mode": "simulated"})
 
         try:
-            img = self._client.send_command(destination, "get_scanned_image", {
-                "scanning_detector": detector,
-                "size": 512,
-                "dwell_time": 2e-6
-            })
-            return ImageResult(data=img, metadata={"detector": detector})
+            detector_name = detector.lower().strip()
+            encoded = self._client.get_image(detector_name)
+            metadata_json, raw_bytes = encoded
+            metadata = json.loads(metadata_json)
+            img = np.frombuffer(raw_bytes, dtype=metadata["dtype"]).reshape(metadata["shape"])
+            metadata.update({"detector": detector_name, "backend": self._backend})
+            return ImageResult(data=img, metadata=metadata)
         except Exception as e:
             print(f"Error acquiring image: {e}")
             raise

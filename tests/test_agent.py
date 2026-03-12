@@ -7,19 +7,18 @@ from app.config import settings
 settings.hf_cache_dir = "/lustre/isaac24/scratch/dpelaia/hf_cache/"
 
 from app.agent.core import Agent
+from app.utils.server_cli import show_interactive_server_commands
 
 def main():
-    agent = Agent(model_id="Qwen/Qwen2.5-32B-Instruct")
+    show_interactive_server_commands()
 
-    settings.instrument_host = "localhost"
-    settings.instrument_port = 9001
-    settings.autoscript_port = 9001
+    # agent = Agent(model_id="Qwen/Qwen2.5-Coder-32B-Instruct")
 
-    prompt = """
-    Get an image on a mock microscope.
-    """
+    # prompt = """
+    # Take an image and close the microscope. The servers are already running and connected.
+    # """
 
-    response = agent.chat(prompt)
+    # response = agent.chat(prompt)
 
 if __name__ == "__main__":
     main()

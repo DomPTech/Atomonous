@@ -22,7 +22,7 @@ from smolagents import CodeAgent, TransformersModel, ActionStep
 from smolagents.models import ChatMessageStreamDelta, ChatMessage
 
 from app.tools import microscopy
-from app.tools.microscopy import TOOLS, NODE_REGISTRY, MicroscopeServer, WorkflowTemplate, WorkflowExecutor, get_last_created_workflow
+from app.tools.microscopy import TOOLS, NODE_REGISTRY, WorkflowTemplate, WorkflowExecutor, get_last_created_workflow
 from app.utils.helpers import get_total_ram_gb
 from app.utils.memory import SessionMemory
 from app.agent.supervised_executor import SupervisedExecutor
@@ -227,7 +227,7 @@ class Agent:
                - This keeps the workflow graph clean and allows the Agent to use higher-level logic (like Python loops) during execution.
                 4. **CodeNode execution mode (CRITICAL)**: If a prompt says you are executing an already-designed workflow step/task node, do not design a new workflow and do not suggest node structures. Execute the requested operations directly using tools and/or python_executor.
             
-            'settings' and the 'MicroscopeServer' Enum are pre-imported and available for use in your code execution environment.
+            'settings' is pre-imported and available for use in your code execution environment.
             """,
             stream_outputs=True
         )
@@ -244,7 +244,6 @@ class Agent:
         """
         try:
             self.agent.python_executor.send_variables({
-                "MicroscopeServer": MicroscopeServer,
                 "tem": MicroscopeClientProxy(),
                 "pt": pt,
                 "np": np,
