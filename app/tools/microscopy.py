@@ -16,16 +16,71 @@ from enum import Enum
 import pyTEMlib.probe_tools as pt
 import json
 
-from asyncroscopy.detectors.HAADF import HAADF
-from asyncroscopy.ThermoDigitalTwin import ThermoDigitalTwin
-from asyncroscopy.ThermoMicroscope import ThermoMicroscope
+try:
+    from autoscript_tem_microscope_client import TemMicroscopeClient
+    from autoscript_tem_microscope_client.enumerations import EdsDetectorType, ExposureTimeType
+    from autoscript_tem_microscope_client.structures import EdsAcquisitionSettings
+    _AUTOSCRIPT_DIRECT_AVAILABLE = True
+except ImportError:
+    _AUTOSCRIPT_DIRECT_AVAILABLE = False
 
 # Global state
 CLIENT: Optional[object] = None  # tango.DeviceProxy
 SERVER_PROCESSES: Dict[str, subprocess.Popen] = {}
 SERVER_CONTEXT: Optional[MultiDeviceTestContext] = None
-SERVER_DEVICE_NAME: str = "test/nodb/microscope"
+SERVER_DEVICE_NAME: str = "tango://127.0.0.1:8889/test/nodb/thermomicroscope#dbase=no"
+HAADF_DEVICE_NAME: str = "tango://127.0.0.1:8888/test/nodb/haadf#dbase=no"
+MICROSCOPE_HOST: str = "127.0.0.1"
+MICROSCOPE_PORT: int = 8889
+HAADF_PORT: int = 8888
 AGENT_INSTANCE: Optional[object] = None  # Set by Agent.__init__() for artifact memory access
+DEFAULT_TANGO_TIMEOUT_MS: int = 60000
+
+
+def _acquire_eds_direct(
+    exposure_time: float,
+    dispersion: int,
+    shaping_time: float,
+) -> np.ndarray:
+    """Fallback path for EDS acquisition via direct AutoScript client access."""
+    if not _AUTOSCRIPT_DIRECT_AVAILABLE:
+        raise RuntimeError("AutoScript client library is not available in this environment.")
+
+    microscope = TemMicroscopeClient()
+    try:
+        microscope.connect(settings.instrument_host, settings.autoscript_port)
+
+        eds_settings = EdsAcquisitionSettings()
+        eds_settings.eds_detector = EdsDetectorType.SUPER_X
+        eds_settings.dispersion = int(dispersion)
+        eds_settings.shaping_time = float(shaping_time)
+        eds_settings.exposure_time = float(exposure_time)
+        eds_settings.exposure_time_type = ExposureTimeType.LIVE_TIME
+
+        spectrum = microscope.analysis.eds.acquire_spectrum(eds_settings)
+        if isinstance(spectrum, np.ndarray):
+            return spectrum
+
+        dt = np.dtype("uint32").newbyteorder("<")
+        return np.frombuffer(spectrum._raw_data, dtype=dt)
+    finally:
+        try:
+            microscope.disconnect()
+        except Exception:
+            pass
+
+
+def _is_tango_timeout_error(exc: Exception) -> bool:
+    """Return True when a PyTango exception indicates a command timeout."""
+    if not isinstance(exc, tango.DevFailed):
+        return False
+
+    for err in exc.args:
+        reason = getattr(err, "reason", "") or ""
+        desc = getattr(err, "desc", "") or ""
+        if reason == "API_DeviceTimedOut" or "CallTimedout" in desc or "Timeout" in desc:
+            return True
+    return False
 
 def _wait_for_port(host: str, port: int, timeout: float = 10.0) -> bool:
     """Wait for a port to become available (server listening)."""
@@ -44,85 +99,162 @@ def _wait_for_port(host: str, port: int, timeout: float = 10.0) -> bool:
     return False
 
 @tool
-def start_server(mode: str = "mock") -> str:
+def start_server(mode: str = "mock", haadf_port: int = None, microscope_port: int = None) -> str:
     """
-    Starts asyncroscopy PyTango devices using an in-process test context.
+    Starts asyncroscopy PyTango devices as separate subprocesses using tango.test_context.
+    
+    This connects to servers started externally via:
+      uv run python -m tango.test_context asyncroscopy.detectors.HAADF.HAADF --host 127.0.0.1 --port 8888
+      uv run python -m tango.test_context asyncroscopy.ThermoDigitalTwin.ThermoDigitalTwin --host 127.0.0.1 --port 8889 --prop "..."
     
     Args:
         mode: "mock" for ThermoDigitalTwin (simulation), "real" for ThermoMicroscope.
+        haadf_port: Port for HAADF detector (default 8888).
+        microscope_port: Port for Microscope (default 8889).
+    
+    Returns:
+        Status message indicating success or failure.
     """
-    global SERVER_CONTEXT, SERVER_DEVICE_NAME
+    global SERVER_PROCESSES, HAADF_PORT, MICROSCOPE_PORT, SERVER_DEVICE_NAME, HAADF_DEVICE_NAME, MICROSCOPE_HOST
+    
+    if haadf_port is not None:
+        HAADF_PORT = haadf_port
+    if microscope_port is not None:
+        MICROSCOPE_PORT = microscope_port
 
-    if SERVER_CONTEXT is not None:
-        return "PyTango asyncroscopy server context already running."
+    microscope_device_basename = "thermomicroscope" if mode == "real" else "thermodigitaltwin"
+    SERVER_DEVICE_NAME = (
+        f"tango://{MICROSCOPE_HOST}:{MICROSCOPE_PORT}/test/nodb/{microscope_device_basename}#dbase=no"
+    )
+    HAADF_DEVICE_NAME = f"tango://{MICROSCOPE_HOST}:{HAADF_PORT}/test/nodb/haadf#dbase=no"
+    
+    if SERVER_PROCESSES:
+        return "PyTango asyncroscopy servers already running."
 
     try:
-        microscope_cls = ThermoDigitalTwin if mode == "mock" else ThermoMicroscope
-        microscope_name = "test/nodb/microscope"
-        haadf_name = "test/nodb/haadf"
-
-        microscope_properties = {
-            "haadf_device_address": haadf_name,
-        }
-        if mode == "real":
-            microscope_properties.update(
-                {
-                    "autoscript_host_ip": settings.instrument_host,
-                    "autoscript_host_port": settings.autoscript_port,
-                }
-            )
-
-        devices_info = [
-            {
-                "class": HAADF,
-                "devices": [{"name": haadf_name, "properties": {}}],
-            },
-            {
-                "class": microscope_cls,
-                "devices": [
-                    {
-                        "name": microscope_name,
-                        "properties": microscope_properties,
-                    }
-                ],
-            },
+        # Start HAADF detector
+        haadf_cmd = [
+            sys.executable, "-m", "tango.test_context",
+            "asyncroscopy.detectors.HAADF.HAADF",
+            "--host", MICROSCOPE_HOST,
+            "--port", str(HAADF_PORT)
         ]
-
-        SERVER_CONTEXT = MultiDeviceTestContext(devices_info, process=False)
-        SERVER_CONTEXT.__enter__()
-        SERVER_DEVICE_NAME = microscope_name
-
-        # Smoke check that microscope device is reachable
-        proxy = tango.DeviceProxy(microscope_name)
-        _ = proxy.state()
-
-        return f"Started PyTango asyncroscopy context ({mode}) with devices: {microscope_name}, {haadf_name}."
+        print(f"[TOOLS] Starting HAADF detector: {' '.join(haadf_cmd)}")
+        haadf_proc = subprocess.Popen(haadf_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        SERVER_PROCESSES["haadf"] = haadf_proc
+        
+        # Wait for HAADF to be ready
+        if not _wait_for_port(MICROSCOPE_HOST, HAADF_PORT, timeout=15.0):
+            _cleanup_server_processes()
+            return f"Timeout waiting for HAADF detector on port {HAADF_PORT}"
+        
+        print(f"[TOOLS] HAADF detector ready on port {HAADF_PORT}")
+        time.sleep(0.5)  # Extra buffer between server starts
+        
+        # Determine microscope class and properties
+        if mode == "real":
+            microscope_cls = "asyncroscopy.ThermoMicroscope.ThermoMicroscope"
+            haadf_addr = HAADF_DEVICE_NAME
+            props = {
+                'haadf_device_address': haadf_addr,
+                'autoscript_host_ip': settings.instrument_host,
+                'autoscript_host_port': settings.autoscript_port,
+            }
+        else:
+            microscope_cls = "asyncroscopy.ThermoDigitalTwin.ThermoDigitalTwin"
+            haadf_addr = HAADF_DEVICE_NAME
+            props = {
+                'haadf_device_address': haadf_addr,
+            }
+        
+        # Convert props dict to JSON string for --prop argument
+        props_json = json.dumps(props)
+        
+        # Start Microscope (using digital twin for mock mode)
+        microscope_cmd = [
+            sys.executable, "-m", "tango.test_context",
+            microscope_cls,
+            "--host", MICROSCOPE_HOST,
+            "--port", str(MICROSCOPE_PORT),
+            "--prop", props_json
+        ]
+        print(f"[TOOLS] Starting Microscope ({mode}): {' '.join(microscope_cmd)}")
+        microscope_proc = subprocess.Popen(microscope_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        SERVER_PROCESSES["microscope"] = microscope_proc
+        
+        # Wait for Microscope to be ready
+        if not _wait_for_port(MICROSCOPE_HOST, MICROSCOPE_PORT, timeout=15.0):
+            _cleanup_server_processes()
+            return f"Timeout waiting for Microscope on port {MICROSCOPE_PORT}"
+        
+        print(f"[TOOLS] Microscope ready on port {MICROSCOPE_PORT}")
+        time.sleep(0.5)
+        
+        # Verify both are accessible
+        try:
+            haadf_proxy = tango.DeviceProxy(HAADF_DEVICE_NAME)
+            haadf_state = haadf_proxy.state()
+            print(f"[TOOLS] HAADF state: {haadf_state}")
+        except Exception as e:
+            print(f"[TOOLS WARNING] Could not verify HAADF: {e}")
+        
+        try:
+            microscope_proxy = tango.DeviceProxy(SERVER_DEVICE_NAME)
+            microscope_state = microscope_proxy.state()
+            print(f"[TOOLS] Microscope state: {microscope_state}")
+        except Exception as e:
+            print(f"[TOOLS WARNING] Could not verify Microscope: {e}")
+        
+        return f"Started PyTango asyncroscopy servers ({mode}): HAADF on port {HAADF_PORT}, Microscope on port {MICROSCOPE_PORT}"
     except Exception as e:
-        if SERVER_CONTEXT is not None:
+        _cleanup_server_processes()
+        return f"Failed to start PyTango asyncroscopy servers: {e}"
+
+
+def _cleanup_server_processes() -> None:
+    """Kill all server processes."""
+    global SERVER_PROCESSES
+    for name, proc in SERVER_PROCESSES.items():
+        try:
+            proc.terminate()
             try:
-                SERVER_CONTEXT.__exit__(None, None, None)
-            except Exception:
-                pass
-            SERVER_CONTEXT = None
-        return f"Failed to start PyTango asyncroscopy context: {e}"
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            print(f"[TOOLS] Terminated {name} server process")
+        except Exception as e:
+            print(f"[TOOLS WARNING] Failed to terminate {name}: {e}")
+    SERVER_PROCESSES.clear()
 
 @tool
-def connect_client() -> str:
+def connect_client(microscope_device: str = None) -> str:
     """
     Connects a Tango DeviceProxy client to the microscope device.
     
+    Expects external Tango servers to already be running (started via start_server()).
+    
     Args:
-        None.
+        microscope_device: Full Tango device address. If None, uses default: 
+                          "tango://127.0.0.1:8889/test/nodb/thermomicroscope#dbase=no"
+    
+    Returns:
+        Status message indicating connection success or failure.
     """
-    global CLIENT
+    global CLIENT, SERVER_DEVICE_NAME
 
     try:
-        if SERVER_CONTEXT is None:
-            return "FATAL: No running PyTango context. Call start_server() first."
-
-        CLIENT = tango.DeviceProxy(SERVER_DEVICE_NAME)
+        device_addr = microscope_device or SERVER_DEVICE_NAME
+        
+        print(f"[TOOLS] Connecting to microscope at: {device_addr}")
+        CLIENT = tango.DeviceProxy(device_addr)
+        CLIENT.set_timeout_millis(DEFAULT_TANGO_TIMEOUT_MS)
+        
+        # Test the connection
         state = CLIENT.state()
-        return f"Connected to PyTango microscope client at {SERVER_DEVICE_NAME}. State: {state}"
+        print(f"[TOOLS] Connected! Microscope state: {state}")
+        
+        return f"Connected to PyTango microscope at {device_addr}. State: {state}"
     except Exception as e:
         CLIENT = None
         return f"FATAL: Connection error: {e}"
@@ -210,20 +342,122 @@ def take_image(detector: str = "haadf") -> str:
     return capture_image(detector=detector)
 
 @tool
+def get_eds_spectrum(
+    exposure_time: float = 2.0,
+    dispersion: int = 5,
+    shaping_time: float = 3e-6,
+    destination: str = "AS",
+) -> str:
+    """
+    Acquires an EDS (Energy Dispersive X-ray Spectroscopy) spectrum from the microscope.
+
+    Calls the 'acquire_eds' command on the microscope server, which uses the SUPER_X
+    detector by default. The resulting spectrum (counts vs. channel) is saved as a
+    NumPy .npy file for downstream analysis.
+
+    Args:
+        exposure_time: Acquisition live-time in seconds (default 2.0).
+        dispersion: Energy dispersion in eV/channel (default 5).
+        shaping_time: Detector shaping time in seconds (default 3e-6).
+        destination: The server to send the command to (default 'AS').
+
+    Returns:
+        A string describing the saved spectrum path, shape, and basic statistics,
+        or an error message on failure.
+    """
+    global CLIENT, AGENT_INSTANCE
+    if not CLIENT:
+        return "Error: Client not connected."
+
+    try:
+        params = {
+            "exposure_time": exposure_time,
+            "dispersion": dispersion,
+            "shaping_time": shaping_time,
+        }
+        print(f"[TOOLS] Requesting EDS spectrum from '{destination}' with params {params} ...")
+        if hasattr(CLIENT, "acquire_eds"):
+            eds_timeout_ms = max(DEFAULT_TANGO_TIMEOUT_MS, int((float(exposure_time) + 10.0) * 1000))
+            CLIENT.set_timeout_millis(eds_timeout_ms)
+            print(f"[TOOLS] Calling Tango acquire_eds with timeout {eds_timeout_ms} ms")
+            try:
+                encoded = CLIENT.acquire_eds(json.dumps(params))
+            except tango.DevFailed as exc:
+                if not _is_tango_timeout_error(exc):
+                    raise
+                print("[TOOLS] Tango acquire_eds timed out; falling back to direct AutoScript access.")
+                spectrum_data = _acquire_eds_direct(
+                    exposure_time=exposure_time,
+                    dispersion=dispersion,
+                    shaping_time=shaping_time,
+                )
+            else:
+                if encoded is None or len(encoded) != 2:
+                    return "Error: Invalid encoded EDS response from the microscope."
+
+                metadata_json, raw_bytes = encoded
+                metadata = json.loads(metadata_json)
+                spectrum_data = np.frombuffer(raw_bytes, dtype=metadata["dtype"]).reshape(metadata["shape"])
+        else:
+            print("[TOOLS] Tango proxy has no 'acquire_eds' command; falling back to direct AutoScript access.")
+            spectrum_data = _acquire_eds_direct(
+                exposure_time=exposure_time,
+                dispersion=dispersion,
+                shaping_time=shaping_time,
+            )
+
+        if spectrum_data is None:
+            return "Error: No spectrum data returned from the microscope."
+
+        # Determine save path (use agent session dir if available, else /tmp)
+        output_filename = f"eds_spectrum_{int(time.time())}.npy"
+        full_path = None
+
+        try:
+            if (
+                AGENT_INSTANCE
+                and hasattr(AGENT_INSTANCE, "memory")
+                and AGENT_INSTANCE.memory
+                and hasattr(AGENT_INSTANCE.memory, "session_dir")
+            ):
+                from pathlib import Path as _Path
+                full_path = str(_Path(AGENT_INSTANCE.memory.session_dir) / output_filename)
+        except (AttributeError, TypeError, NameError):
+            pass
+
+        if not full_path:
+            full_path = f"/tmp/{output_filename}"
+
+        np.save(full_path, spectrum_data)
+
+        total_counts = int(spectrum_data.sum())
+        peak_channel = int(np.argmax(spectrum_data))
+        peak_counts = int(spectrum_data[peak_channel])
+
+        return (
+            f"EDS spectrum acquired and saved to {full_path} "
+            f"(channels: {spectrum_data.shape[0]}, "
+            f"total counts: {total_counts}, "
+            f"peak channel: {peak_channel} ({peak_counts} counts))"
+        )
+    except Exception as e:
+        return f"Error acquiring EDS spectrum: {e}"
+
+@tool
 def close_microscope() -> str:
     """
-    Safely closes the microscope connection and stops the servers.
+    Safely closes the microscope connection and stops the external servers.
     """
     global SERVER_PROCESSES, CLIENT, SERVER_CONTEXT
     resp = "Microscope closed."
     
     CLIENT = None
     
-    for module, proc in SERVER_PROCESSES.items():
-        proc.terminate()
-        resp += f" {module} stopped."
-    SERVER_PROCESSES.clear()
+    # Kill external server processes
+    _cleanup_server_processes()
+    resp += " External servers stopped."
 
+    # Legacy cleanup for in-process context (if applicable)
     if SERVER_CONTEXT is not None:
         try:
             SERVER_CONTEXT.__exit__(None, None, None)
@@ -313,42 +547,43 @@ def place_beam(x: float, y: float, destination: str = "AS") -> str:
         return f"Error placing beam: {e}"
 
 @tool
-def blank_beam(destination: str = "AS") -> str:
+def blank_beam() -> str:
     """
     Blanks the electron beam.
     
     Args:
-        destination: The server to send the command to (default 'AS').
+        None.
     """
     global CLIENT
     if not CLIENT:
         return "Error: Client not connected."
     
     try:
-        resp = CLIENT.send_command(destination, "blank_beam")
+        resp = CLIENT.command_inout("blank_beam")
         return f"Blank beam response: {resp}"
     except Exception as e:
         return f"Error blanking beam: {e}"
 
 @tool
-def unblank_beam(duration: Optional[float] = None, destination: str = "AS") -> str:
+def unblank_beam(duration: Optional[float] = None) -> str:
     """
     Unblanks the electron beam.
     
     Args:
         duration: Optional dwell time in seconds. If provided, the beam will auto-blank after this time.
-        destination: The server to send the command to (default 'AS').
     """
     global CLIENT
     if not CLIENT:
         return "Error: Client not connected."
     
-    args = {}
-    if duration is not None:
-        args["duration"] = duration
-    
     try:
-        resp = CLIENT.send_command(destination, "unblank_beam", args)
+        resp = CLIENT.command_inout("unblank_beam")
+
+        if duration is not None:
+            time.sleep(duration)
+            CLIENT.command_inout("blank_beam")
+            return f"Unblank beam response: {resp}. Beam auto-blanked after {duration} s."
+
         return f"Unblank beam response: {resp}"
     except Exception as e:
         return f"Error unblanking beam: {e}"
@@ -521,6 +756,7 @@ TOOLS = [
     start_server,
     connect_client,
     take_image,
+    get_eds_spectrum,
     close_microscope,
 ]
 
