@@ -1,8 +1,11 @@
 import sys
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, Any, Dict, List
 import yaml
 import numpy as np
+from datetime import datetime
+import json
+import base64
 
 # Ensure project root is on sys.path for reliable imports
 _PROJECT_ROOT = None
@@ -16,11 +19,11 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import torch
-from smolagents import CodeAgent, TransformersModel, ActionStep, Model, LiteLLMModel
+from smolagents import CodeAgent, TransformersModel, ActionStep, Model, LiteLLMModel, MCPClient
 from smolagents.models import ChatMessageStreamDelta, ChatMessage
 
 from app.tools import microscopy
-from app.tools.microscopy import TOOLS, NODE_REGISTRY, WorkflowTemplate, WorkflowExecutor, get_last_created_workflow
+from app.tools.microscopy import NODE_REGISTRY, WorkflowTemplate, WorkflowExecutor, get_last_created_workflow
 from app.utils.helpers import get_total_ram_gb
 from app.utils.memory import SessionMemory
 from app.agent.supervised_executor import SupervisedExecutor
@@ -116,13 +119,13 @@ class Agent:
             session_name=session_name
         )
 
-        # Workflow approval state
-        self.workflow_approval_pending = False
-        self.detected_workflow_path = None
+        # Initialize MCP Client
+        self.mcp_client = MCPClient({"url": settings.mcp_url, "transport": "streamable-http"}, structured_output=False)
+        mcp_tools = [self._wrap_mcp_tool(t) for t in self.mcp_client.get_tools()]
 
         # Full tool suite for the microscopy agent
         self.agent = CodeAgent(
-            tools=TOOLS, 
+            tools=mcp_tools, 
             model=self.model,
             max_steps=settings.agent_max_steps,  # Configurable limit to prevent infinite loops
             executor=SupervisedExecutor(additional_authorized_imports=[
@@ -162,6 +165,10 @@ class Agent:
 
         # Inject agent instance for workflow execution (self = Agent wrapper with memory)
         microscopy.AGENT_INSTANCE = self
+        
+        # Track workflow approval state
+        self.workflow_approval_pending = False
+        self.detected_workflow_path = None
 
         # Preload common classes into the Python executor context
         self._setup_executor_context()
@@ -268,13 +275,14 @@ class Agent:
             The agent's response as a string.
         """
         # Determine which tools to use
+        all_tools = [self._wrap_mcp_tool(t) for t in self.mcp_client.get_tools()]
         if allowed_tools is not None:
-            filtered_tools = [t for t in TOOLS if getattr(t, "name", None) in allowed_tools]
+            filtered_tools = [t for t in all_tools if getattr(t, "name", None) in allowed_tools]
         elif disallowed_tools is not None:
             disallowed_set = set(disallowed_tools)
-            filtered_tools = [t for t in TOOLS if getattr(t, "name", None) not in disallowed_set]
+            filtered_tools = [t for t in all_tools if getattr(t, "name", None) not in disallowed_set]
         else:
-            filtered_tools = TOOLS
+            filtered_tools = all_tools
         
         subagent = CodeAgent(
             tools=filtered_tools,
@@ -291,6 +299,77 @@ class Agent:
         self._setup_executor_context()
         
         return str(subagent.run(prompt)).strip()
+
+    def _wrap_mcp_tool(self, tool: Any) -> Any:
+        """
+        Wraps an MCP tool to intercept large base64 outputs and save them as artifacts.
+        
+        This prevents the LLM from seeing massive base64 strings and keeps the context clean.
+        """
+        original_forward = tool.forward
+
+        def wrapped_forward(*args, **kwargs):
+            result = original_forward(*args, **kwargs)
+            
+            # Identify large microscopy payloads returned as JSON strings
+            if isinstance(result, str) and result.strip().startswith('{'):
+                try:
+                    # Quick check before full JSON parse
+                    if '"payload":' not in result or '"metadata":' not in result:
+                        return result
+
+                    data = json.loads(result)
+                    payload = data.get("payload")
+                    metadata_raw = data.get("metadata")
+                    
+                    if payload and metadata_raw and isinstance(payload, str) and len(payload) > 500:
+                        meta = json.loads(metadata_raw)
+                        decoded_bytes = base64.b64decode(payload.encode('utf-8'))
+                        
+                        timestamp = datetime.now().strftime("%H%M%S")
+                        dtype = meta.get("dtype", "uint8")
+                        shape = meta.get("shape")
+                        
+                        # Determine if it's image data (Numpy array) or spectrum data (JSON)
+                        if shape and isinstance(shape, (list, tuple)) and len(shape) >= 2:
+                            file_name = f"scan_{timestamp}_{shape[0]}x{shape[1]}.npy"
+                            file_path = self.memory.session_dir / file_name
+                            # Reshape and save as npy for high-fidelity storage
+                            arr = np.frombuffer(decoded_bytes, dtype=dtype).reshape(shape)
+                            np.save(file_path, arr)
+                            
+                            # Return a concise summary to the LLM
+                            return (
+                                f"SUCCESS: Scanned image data ({shape[0]}x{shape[1]}, {dtype}) "
+                                f"was captured and saved to: {file_path}.\\n"
+                                f"Metadata: {metadata_raw}"
+                            )
+                        else:
+                            # Likely an EDS spectrum or other structured data
+                            try:
+                                spectrum_data = json.loads(decoded_bytes.decode('utf-8'))
+                                file_name = f"spectrum_{timestamp}.json"
+                                file_path = self.memory.session_dir / file_name
+                                with open(file_path, 'w') as f:
+                                    json.dump(spectrum_data, f, indent=2)
+                                
+                                return f"SUCCESS: EDS spectrum data saved to: {file_path}.\\nMetadata: {metadata_raw}"
+                            except Exception:
+                                # Raw binary fallback
+                                file_name = f"raw_data_{timestamp}.bin"
+                                file_path = self.memory.session_dir / file_name
+                                with open(file_path, 'wb') as f:
+                                    f.write(decoded_bytes)
+                                return f"SUCCESS: Data saved to: {file_path}.\\nMetadata: {metadata_raw}"
+                                
+                except Exception as e:
+                    # Tool wrapping failure should not crash the agent; fallback to raw result
+                    print(f"[Warning] Failed to wrap tool output: {e}")
+            
+            return result
+
+        tool.forward = wrapped_forward
+        return tool
 
     def _handle_agent_step(self, memory_step, agent) -> None:
         """

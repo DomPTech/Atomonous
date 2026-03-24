@@ -1,5 +1,5 @@
 streamlit
-smolagents[toolkit]
+smolagents[toolkit,mcp]
 transformers
 accelerate
 bitsandbytes
@@ -21,7 +21,6 @@ pytest
 fastapi
 uvicorn
 python-multipart
--e external/asyncroscopy
 pyyaml
 graphviz
 pydot

@@ -27,6 +27,7 @@ class MicroscopeSettings(BaseSettings):
     # Paths and Networks
     server_host: str = Field("127.0.0.1", description="Hostname for the asyncroscopy server")
     server_port: int = Field(9000, description="Port for the central asyncroscopy server")
+    mcp_url: str = Field("http://localhost:8000/mcp", description="URL for the MCP server")
     
     # AutoScript / Hardware Paths
     autoscript_path: str = Field(
