@@ -7,8 +7,14 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from app.tools.microscopy import start_server, connect_client, close_microscope, capture_image
-from app.microscope_api import MicroscopeControl, StagePosition
+from app.microscope_api import (
+    MicroscopeControl,
+    StagePosition,
+    start_server,
+    connect_client,
+    close_microscope,
+    capture_image,
+)
 from app.config import settings
 
 
@@ -42,7 +48,7 @@ def test_image_stitching_workflow():
         pos = positions[idx]
         control.set_stage_position(pos)
         print(f"Capturing image at resolution: {res} at position: {(pos.x, pos.y, pos.z)}")
-        img_res = capture_image(detector="HAADF")
+        img_res = control.acquire_image(detector="HAADF")
         print(f"Capture image: {img_res}")
         assert ".npy" in img_res
         image_paths.append(img_res)
