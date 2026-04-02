@@ -22,8 +22,9 @@ import torch
 from smolagents import CodeAgent, TransformersModel, ActionStep, Model, LiteLLMModel, MCPClient
 from smolagents.models import ChatMessageStreamDelta, ChatMessage
 
-from atomonous.tools import microscopy
-from atomonous.tools.microscopy import NODE_REGISTRY, WorkflowTemplate, WorkflowExecutor, get_last_created_workflow
+from atomonous.tools import workflows
+from atomonous.tools.workflows import get_workflow_tools, get_default_registry
+from atomonous.tools.workflow_framework import WorkflowTemplate, WorkflowExecutor
 from atomonous.utils.helpers import get_total_ram_gb
 from atomonous.utils.memory import SessionMemory
 from atomonous.agent.supervised_executor import SupervisedExecutor
@@ -100,12 +101,7 @@ def _should_generate_workflow(query: str) -> bool:
 
     return False
 
-class MicroscopeClientProxy:
-    """Proxy to forward calls to the active global CLIENT instance."""
-    def __getattr__(self, name):
-        if microscopy.CLIENT is None:
-             raise RuntimeError("Microscope client is not connected. Please call 'connect_client()' first.")
-        return getattr(microscopy.CLIENT, name)
+
 
 class Agent:
     def __init__(self, model: Model, session_name: str = ""):
@@ -121,29 +117,26 @@ class Agent:
         self.mcp_client = MCPClient({"url": settings.mcp_url, "transport": "streamable-http"}, structured_output=False)
         mcp_tools = [self._wrap_mcp_tool(t) for t in self.mcp_client.get_tools()]
 
-        # Full tool suite for the microscopy agent
+        # Full tool suite combining external MCP tools and native workflow tools
+        workflow_tools = get_workflow_tools(self)
+        all_tools = mcp_tools + workflow_tools
+
         self.agent = CodeAgent(
-            tools=mcp_tools, 
+            tools=all_tools, 
             model=self.model,
             max_steps=settings.agent_max_steps,  # Configurable limit to prevent infinite loops
             executor=SupervisedExecutor(additional_authorized_imports=[
-                "app.tools.microscopy", "app.config.*", 
+                "atomonous.tools.workflows", "atomonous.config.*", 
                 "numpy", "time", "os", "scipy", "json", "yaml"
             ]),
             step_callbacks={ActionStep : self._handle_agent_step},
             instructions="""
-            You are an expert microscopy AI assistant. 
-            You can control the microscope by starting the server, connecting the client, and then using tools to:
-            - Adjust magnification and capture images.
-            - Move the stage and check status.
-            - Control the electron beam (blank/unblank, place beam).
-            - Calibrate and set screen current.
-            - And more.
+            You are an expert scientific AI assistant powered by the Atomonous framework. 
+            You can interact with the current context and instrumentation dynamically through the available MCP tools.
 
             Guidelines:
             1. Use 'settings' for configuration:
                - Use 'settings.server_host' and 'settings.server_port' for connections.
-               - Use 'settings.autoscript_path' if needed for server startup.
             2. Reliability and truthfulness are mandatory:
                     - Never claim success unless tool outputs explicitly confirm success.
                     - If any tool output contains failure indicators (e.g. "error", "failed", "could not", "exception", "timeout"), treat the task as failed.
@@ -161,9 +154,6 @@ class Agent:
             stream_outputs=True
         )
 
-        # Inject agent instance for workflow execution (self = Agent wrapper with memory)
-        microscopy.AGENT_INSTANCE = self
-        
         # Track workflow approval state
         self.workflow_approval_pending = False
         self.detected_workflow_path = None
@@ -247,8 +237,6 @@ class Agent:
         """
         try:
             self.agent.python_executor.send_variables({
-                "tem": MicroscopeClientProxy(),
-                "pt": pt,
                 "np": np,
                 "settings": settings,
                 "yaml": yaml,
@@ -273,7 +261,7 @@ class Agent:
             The agent's response as a string.
         """
         # Determine which tools to use
-        all_tools = [self._wrap_mcp_tool(t) for t in self.mcp_client.get_tools()]
+        all_tools = [self._wrap_mcp_tool(t) for t in self.mcp_client.get_tools()] + get_workflow_tools(self)
         if allowed_tools is not None:
             filtered_tools = [t for t in all_tools if getattr(t, "name", None) in allowed_tools]
         elif disallowed_tools is not None:
@@ -287,7 +275,7 @@ class Agent:
             model=self.model,
             max_steps=settings.agent_max_steps,  # Configurable limit to prevent infinite loops
             executor=SupervisedExecutor(additional_authorized_imports=[
-                "app.tools.microscopy", "app.config.*",
+                "atomonous.tools.workflows", "atomonous.config.*",
                 "numpy", "time", "os", "scipy", "json", "yaml"
             ]),
             instructions=self.agent.instructions,
@@ -301,7 +289,6 @@ class Agent:
     def _wrap_mcp_tool(self, tool: Any) -> Any:
         """
         Wraps an MCP tool to intercept large base64 outputs and save them as artifacts.
-        
         This prevents the LLM from seeing massive base64 strings and keeps the context clean.
         """
         original_forward = tool.forward
@@ -309,10 +296,9 @@ class Agent:
         def wrapped_forward(*args, **kwargs):
             result = original_forward(*args, **kwargs)
             
-            # Identify large microscopy payloads returned as JSON strings
+            # Identify large payloads returned as JSON strings
             if isinstance(result, str) and result.strip().startswith('{'):
                 try:
-                    # Quick check before full JSON parse
                     if '"payload":' not in result or '"metadata":' not in result:
                         return result
 
@@ -325,43 +311,17 @@ class Agent:
                         decoded_bytes = base64.b64decode(payload.encode('utf-8'))
                         
                         timestamp = datetime.now().strftime("%H%M%S")
-                        dtype = meta.get("dtype", "uint8")
-                        shape = meta.get("shape")
                         
-                        # Determine if it's image data (Numpy array) or spectrum data (JSON)
-                        if shape and isinstance(shape, (list, tuple)) and len(shape) >= 2:
-                            file_name = f"scan_{timestamp}_{shape[0]}x{shape[1]}.npy"
-                            file_path = self.memory.session_dir / file_name
-                            # Reshape and save as npy for high-fidelity storage
-                            arr = np.frombuffer(decoded_bytes, dtype=dtype).reshape(shape)
-                            np.save(file_path, arr)
+                        file_name = f"data_{timestamp}.bin"
+                        file_path = self.memory.session_dir / file_name
+                        with open(file_path, 'wb') as f:
+                            f.write(decoded_bytes)
                             
-                            # Return a concise summary to the LLM
-                            return (
-                                f"SUCCESS: Scanned image data ({shape[0]}x{shape[1]}, {dtype}) "
-                                f"was captured and saved to: {file_path}.\\n"
-                                f"Metadata: {metadata_raw}"
-                            )
-                        else:
-                            # Likely an EDS spectrum or other structured data
-                            try:
-                                spectrum_data = json.loads(decoded_bytes.decode('utf-8'))
-                                file_name = f"spectrum_{timestamp}.json"
-                                file_path = self.memory.session_dir / file_name
-                                with open(file_path, 'w') as f:
-                                    json.dump(spectrum_data, f, indent=2)
-                                
-                                return f"SUCCESS: EDS spectrum data saved to: {file_path}.\\nMetadata: {metadata_raw}"
-                            except Exception:
-                                # Raw binary fallback
-                                file_name = f"raw_data_{timestamp}.bin"
-                                file_path = self.memory.session_dir / file_name
-                                with open(file_path, 'wb') as f:
-                                    f.write(decoded_bytes)
-                                return f"SUCCESS: Data saved to: {file_path}.\\nMetadata: {metadata_raw}"
-                                
+                        return (
+                            f"SUCCESS: Large payload intercepted and saved to: {file_path}.\\n"
+                            f"Metadata: {metadata_raw}"
+                        )
                 except Exception as e:
-                    # Tool wrapping failure should not crash the agent; fallback to raw result
                     print(f"[Warning] Failed to wrap tool output: {e}")
             
             return result
@@ -384,7 +344,7 @@ class Agent:
         if memory_step.code_action and "design_workflow(" in memory_step.code_action:
             # design_workflow was called in this step, check if it completed successfully
             try:
-                workflow_path = get_last_created_workflow()
+                workflow_path = getattr(self, "last_created_workflow", None)
                 if workflow_path and Path(workflow_path).exists() and workflow_path != self.detected_workflow_path:
                     self.detected_workflow_path = workflow_path
                     # Signal that we should halt and request approval
@@ -433,7 +393,7 @@ class Agent:
         # Capture baseline to avoid accepting pre-existing workflows from previous requests
         baseline_workflow_path = None
         try:
-            baseline_workflow_path = get_last_created_workflow()
+            baseline_workflow_path = getattr(self, "last_created_workflow", None)
         except Exception:
             pass
 
@@ -456,7 +416,7 @@ class Agent:
 
             # Also check if workflow was created (fallback for agents that complete without signal)
             try:
-                yaml_path = get_last_created_workflow()
+                yaml_path = getattr(self, "last_created_workflow", None)
                 if (yaml_path and 
                     Path(yaml_path).exists() and 
                     yaml_path != self.detected_workflow_path and
@@ -478,7 +438,7 @@ class Agent:
             with open(parsed_yaml_path, 'r') as f:
                 parsed_template_yaml = yaml.safe_load(f)
             template = WorkflowTemplate(**parsed_template_yaml)
-            executor = WorkflowExecutor(template, NODE_REGISTRY)
+            executor = WorkflowExecutor(template, get_default_registry())
 
             try:
                 png_path = Path(parsed_yaml_path).parent / (Path(parsed_yaml_path).stem + ".png")
