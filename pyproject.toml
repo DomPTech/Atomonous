@@ -7,10 +7,8 @@ name = "microscopy-ai-agent-demo"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "smolagents[toolkit,mcp,litellm]",
+    "smolagents[toolkit,mcp,litellm,transformers]",
     "litellm==1.82.2",
-    "transformers",
-    "accelerate",
     "bitsandbytes",
     "psutil",
     "wikipedia-api",
@@ -33,6 +31,9 @@ dependencies = [
     "graphviz",
     "pydot",
     "pandas",
+    "Pillow",
+    "h5py",
+    "torch",
 ]
 
 [tool.setuptools.packages.find]

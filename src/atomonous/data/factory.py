@@ -1,8 +1,8 @@
-from pathlib import Path
 from typing import List, Dict, Type, Optional, Any
-from .base import DataConverter, HeuristicMismatchError, AIFormat
+from .converters import DataConverter, HeuristicMismatchError, AIFormat
 from .default_converters.image_converters import TiffConverter, NumpyImageConverter
 from .default_converters.text_converters import CsvConverter, Hdf5SummaryConverter, DictConverter
+from .default_converters.mcp_converter import MCPJsonConverter
 
 class ConverterFactory:
     """
@@ -14,21 +14,22 @@ class ConverterFactory:
         self._converters: List[DataConverter] = []
         
         if register_default:
-            self.register_standard_converters()
+            self.register_default_converters()
             
         if converters:
             for converter in converters:
                 self.register_converter(converter)
 
-    def register_standard_converters(self):
+    def register_default_converters(self):
         """
-        Populate the registry with the standard scientific data converters provided by Atomonous.
+        Populate the registry with the default scientific data converters provided by Atomonous.
         """
         self.register_converter(DictConverter())
         self.register_converter(Hdf5SummaryConverter())
         self.register_converter(CsvConverter())
         self.register_converter(NumpyImageConverter())
         self.register_converter(TiffConverter())
+        self.register_converter(MCPJsonConverter())
 
     def register_converter(self, converter: DataConverter):
         """

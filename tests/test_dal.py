@@ -1,17 +1,11 @@
-import os
-import unittest
 import numpy as np
 import pandas as pd
-import tifffile
-import h5py
-from pathlib import Path
 from PIL import Image
-import json
-import base64
-import io
 from atomonous.data.factory import ConverterFactory
-from atomonous.data.base import DataConverter
-from typing import Type
+from atomonous.data.converters import DataConverter
+import pytest
+import h5py
+
 
 # Mock class
 class MicroscopeImage:
@@ -21,61 +15,103 @@ class MicroscopeImage:
 
 # Mock Converter returning PIL Image
 class MicroscopeImageConverter(DataConverter[MicroscopeImage]):
-    @property
-    def input_type(self) -> Type:
-        return MicroscopeImage
+    input_type = MicroscopeImage
 
     def convert(self, data: MicroscopeImage) -> Image.Image:
-        # Normalize to 8-bit if needed for PIL consumption
         arr = data.data
         if arr.dtype != np.uint8:
             arr = ((arr - arr.min()) / (arr.max() - arr.min() + 1e-5) * 255).astype(np.uint8)
         return Image.fromarray(arr)
 
-class TestDal(unittest.TestCase):
-    def setUp(self):
-        self.default_factory = ConverterFactory(register_default=True)
+@pytest.fixture
+def factory():
+    return ConverterFactory(register_default=True)
 
-    @classmethod
-    def setUpClass(cls):
-        cls.test_dir = Path("/Users/dominick/Microscopy-AI-Agent-Demo/tmp_test_simplified")
-        cls.test_dir.mkdir(exist_ok=True)
-        
-        # Prep sample files
-        cls.csv_path = cls.test_dir / "test.csv"
-        pd.DataFrame({"X": [1, 2]}).to_csv(cls.csv_path, index=False)
-        
-        cls.tiff_path = cls.test_dir / "test.tiff"
-        img = np.random.randint(0, 255, (50, 50), dtype=np.uint8)
-        tifffile.imwrite(str(cls.tiff_path), img)
+@pytest.fixture
+def test_files(tmp_path):
+    # CSV
+    csv_path = tmp_path / "test.csv"
+    pd.DataFrame({"X": [1, 2]}).to_csv(csv_path, index=False)
 
-    @classmethod
-    def tearDownClass(cls):
-        for file in cls.test_dir.glob("*"):
-            file.unlink()
-        cls.test_dir.rmdir()
+    # TIFF
+    tiff_path = tmp_path / "test.tiff"
+    img_data = np.random.randint(0, 255, (50, 50), dtype=np.uint8)
+    Image.fromarray(img_data).save(tiff_path)
 
-    def test_csv_to_string(self):
-        result = self.default_factory.convert(self.csv_path)
-        self.assertIsInstance(result, str)
-        self.assertIn("columns", result)
+    # HDF5
+    h5_path = tmp_path / "test.h5"
+    with h5py.File(h5_path, "w") as f:
+        f.create_dataset("data", data=np.zeros((10, 10)))
+        group = f.create_group("subgroup")
+        group.create_dataset("meta", data=np.ones((5,)))
 
-    def test_tiff_to_pil(self):
-        result = self.default_factory.convert(self.tiff_path)
-        self.assertIsInstance(result, Image.Image)
-        self.assertEqual(result.size, (50, 50))
+    # NPY
+    npy_path = tmp_path / "test.npy"
+    np.save(npy_path, np.random.randint(0, 255, (32, 32), dtype=np.uint8))
 
-    def test_custom_class_to_pil(self):
-        self.default_factory.register_converter(MicroscopeImageConverter())
-        mi = MicroscopeImage(np.random.randint(0, 255, (64, 64), dtype=np.uint8), "Test")
-        result = self.default_factory.convert(mi)
-        self.assertIsInstance(result, Image.Image)
-        self.assertEqual(result.size, (64, 64))
+    return {
+        "csv": csv_path,
+        "tiff": tiff_path,
+        "h5": h5_path,
+        "npy": npy_path
+    }
 
-    def test_dict_to_string(self):
-        result = self.default_factory.convert({"status": "ok"})
-        self.assertIsInstance(result, str)
-        self.assertIn('"status": "ok"', result)
 
-if __name__ == "__main__":
-    unittest.main()
+def test_csv_to_string(factory, test_files):
+    result = factory.convert(test_files["csv"])
+    assert isinstance(result, str)
+    assert "columns" in result
+
+
+def test_tiff_to_pil(factory, test_files):
+    result = factory.convert(test_files["tiff"])
+    assert isinstance(result, Image.Image)
+    assert result.size == (50, 50)
+
+
+def test_custom_class_to_pil(factory):
+    factory.register_converter(MicroscopeImageConverter())
+    mi = MicroscopeImage(
+        np.random.randint(0, 255, (64, 64), dtype=np.uint8),
+        "Test"
+    )
+
+    result = factory.convert(mi)
+    assert isinstance(result, Image.Image)
+    assert result.size == (64, 64)
+
+
+def test_dict_to_string(factory):
+    result = factory.convert({"status": "ok"})
+    assert isinstance(result, str)
+    assert '"status": "ok"' in result
+
+
+def test_h5_to_summary(factory, test_files):
+    result = factory.convert(test_files["h5"])
+    assert isinstance(result, str)
+    assert "subgroup" in result
+    assert "data" in result
+
+
+def test_numpy_file_to_pil(factory, test_files):
+    result = factory.convert(test_files["npy"])
+    assert isinstance(result, Image.Image)
+    assert result.size == (32, 32)
+
+
+def test_numpy_array_to_pil(factory):
+    arr = np.random.randint(0, 255, (16, 16), dtype=np.uint8)
+    result = factory.convert(arr)
+    assert isinstance(result, Image.Image)
+    assert result.size == (16, 16)
+
+
+def test_mcp_json_to_string(factory):
+    mcp_data = {
+        "payload": "Hello MCP",
+        "metadata": {"type": "text"},
+        "encoding": "utf-8"
+    }
+    result = factory.convert(mcp_data)
+    assert result == "Hello MCP"

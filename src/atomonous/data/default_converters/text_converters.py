@@ -1,29 +1,22 @@
 import json
 from pathlib import Path
-from typing import List, Dict, Any, Union, Type
+from typing import List, Dict, Any, Type
 import numpy as np
 import pandas as pd
 import h5py
-from ..base import DataConverter, HeuristicMismatchError, Filepath
+from ..converters import DataConverter, FileDataConverter, HeuristicMismatchError
+from ..types import FilePath
 
-class CsvConverter(DataConverter[Union[pd.DataFrame, Filepath]]):
+class CsvConverter(FileDataConverter[pd.DataFrame | FilePath]):
     """
     Converts CSV files or DataFrames to strings.
     """
 
-    @property
-    def input_type(self) -> Type:
-        return (pd.DataFrame, Path, str)
+    input_type = (pd.DataFrame, FilePath)
+    supported_extensions = {".csv"}
 
-    def can_handle(self, data: Any) -> bool:
-        if isinstance(data, pd.DataFrame):
-            return True
-        if isinstance(data, (Path, str)):
-            return Path(data).suffix.lower() == ".csv"
-        return False
-
-    def convert(self, data: Union[pd.DataFrame, Filepath]) -> str:
-        if isinstance(data, (Path, str)):
+    def convert(self, data: pd.DataFrame | FilePath) -> str:
+        if isinstance(data, FilePath):
             path = Path(data)
             if not path.exists():
                 raise FileNotFoundError(f"CSV file not found: {path}")
@@ -39,23 +32,15 @@ class CsvConverter(DataConverter[Union[pd.DataFrame, Filepath]]):
         
         return json.dumps(summary, indent=2)
 
-class Hdf5SummaryConverter(DataConverter[Union[h5py.File, h5py.Group, Filepath]]):
+class Hdf5SummaryConverter(FileDataConverter[h5py.File | h5py.Group | FilePath]):
     """
     Converts HDF5 files or groups to hierarchical strings.
     """
 
-    @property
-    def input_type(self) -> Type:
-        return (h5py.File, h5py.Group, Path, str)
+    input_type = (h5py.File, h5py.Group, FilePath)
+    supported_extensions = {".h5", ".hdf5"}
 
-    def can_handle(self, data: Any) -> bool:
-        if isinstance(data, (h5py.File, h5py.Group)):
-            return True
-        if isinstance(data, (Path, str)):
-            return Path(data).suffix.lower() in [".h5", ".hdf5"]
-        return False
-
-    def _summarize(self, item: Union[h5py.File, h5py.Group]) -> Dict[str, Any]:
+    def _summarize(self, item: h5py.File | h5py.Group) -> Dict[str, Any]:
         summary = {}
         for name, sub_item in item.items():
             if isinstance(sub_item, (h5py.File, h5py.Group)):
@@ -68,8 +53,8 @@ class Hdf5SummaryConverter(DataConverter[Union[h5py.File, h5py.Group, Filepath]]
                 }
         return summary
 
-    def convert(self, data: Union[h5py.File, h5py.Group, Filepath]) -> str:
-        if isinstance(data, (Path, str)):
+    def convert(self, data: h5py.File | h5py.Group | FilePath) -> str:
+        if isinstance(data, FilePath):
             path = Path(data)
             if not path.exists():
                 raise FileNotFoundError(f"HDF5 file not found: {path}")
@@ -82,9 +67,7 @@ class Hdf5SummaryConverter(DataConverter[Union[h5py.File, h5py.Group, Filepath]]
 
 class DictConverter(DataConverter[dict]):
     """Default converter for dictionaries."""
-    @property
-    def input_type(self) -> Type:
-        return dict
+    input_type = dict
 
     def convert(self, data: dict) -> str:
         return json.dumps(data, indent=2)

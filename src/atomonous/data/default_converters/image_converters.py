@@ -1,57 +1,32 @@
-import io
 from pathlib import Path
-from typing import List, Type, Union, Any
+from typing import List, Type, Any
 import numpy as np
-import tifffile
 from PIL import Image
-from ..base import DataConverter, HeuristicMismatchError, Filepath
+from ..converters import DataConverter, FileDataConverter, HeuristicMismatchError
+from ..types import FilePath
 
-class TiffConverter(DataConverter[Filepath]):
+class TiffConverter(FileDataConverter[FilePath]):
     """
     Converts TIFF files to PIL.Image.Image.
     """
 
-    @property
-    def input_type(self) -> Type:
-        return (Filepath)
+    input_type = FilePath
+    supported_extensions = {".tiff", ".tif"}
 
-    def can_handle(self, data: Any) -> bool:
-        if isinstance(data, (Path, str)):
-            p = Path(data)
-            return p.suffix.lower() in [".tiff", ".tif"]
-        return False
-
-    def convert(self, data: Filepath) -> Image.Image:
+    def convert(self, data: FilePath) -> Image.Image:
         path = Path(data)
-        if not path.exists():
-            raise FileNotFoundError(f"TIFF file not found: {path}")
-            
-        img_data = tifffile.imread(str(path))
-        
-        # Normalize to 8-bit if needed for PIL consumption
-        if img_data.dtype != np.uint8:
-            img_data = ((img_data - img_data.min()) / (img_data.max() - img_data.min() + 1e-5) * 255).astype(np.uint8)
-            
-        return Image.fromarray(img_data)
+        return Image.open(path)
 
-class NumpyImageConverter(DataConverter[Union[np.ndarray, Filepath]]):
+class NumpyImageConverter(FileDataConverter[np.ndarray | FilePath]):
     """
     Uses heuristics to convert numpy arrays (or .npy files) to PIL.Image.Image.
     """
 
-    @property
-    def input_type(self) -> Type:
-        return (np.ndarray, Filepath)
+    input_type = (np.ndarray, FilePath)
+    supported_extensions = {".npy"}
 
-    def can_handle(self, data: Any) -> bool:
-        if isinstance(data, np.ndarray):
-            return True
-        if isinstance(data, (Path, str)):
-            return Path(data).suffix.lower() == ".npy"
-        return False
-
-    def convert(self, data: Union[np.ndarray, Filepath]) -> Image.Image:
-        if isinstance(data, (Path, str)):
+    def convert(self, data: np.ndarray | FilePath) -> Image.Image:
+        if isinstance(data, FilePath):
             path = Path(data)
             if not path.exists():
                 raise FileNotFoundError(f"NPY file not found: {path}")
@@ -69,7 +44,7 @@ class NumpyImageConverter(DataConverter[Union[np.ndarray, Filepath]]):
         if not is_plausible_image:
             raise HeuristicMismatchError(f"Numpy array shape {arr.shape} is not image-like.")
 
-        # Normalize to 8-bit if needed for PIL consumption
+        # PIL works best on 8bit data
         if arr.dtype != np.uint8:
             arr = ((arr - arr.min()) / (arr.max() - arr.min() + 1e-5) * 255).astype(np.uint8)
 

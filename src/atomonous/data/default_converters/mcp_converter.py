@@ -1,22 +1,22 @@
 import json
 import base64
 import io
-from pathlib import Path
-from typing import List, Dict, Any, Union, Type
+from typing import List, Dict, Any, Type
 from PIL import Image
-from ..base import DataConverter, HeuristicMismatchError, AIFormat
+from ..converters import DataConverter, HeuristicMismatchError
+from ..types import AIFormat
 
-class MCPJsonConverter(DataConverter[Union[dict, str]]):
+class MCPJsonConverter(DataConverter[dict | str]):
     """
-    De-serializes the standard MCP-compatible JSON format (dict or string) 
-    back into str or PIL.Image.Image.
+    De-serializes JSON format sent over by the asyncroscopy MCP Server.
     """
 
-    @property
-    def input_type(self) -> Type:
-        return (dict, str)
+    input_type = (dict, str)
 
     def can_handle(self, data: Any) -> bool:
+        if not super().can_handle(data):
+            return False
+            
         if isinstance(data, dict):
             return "payload" in data and "metadata" in data
         if isinstance(data, str):
@@ -25,7 +25,7 @@ class MCPJsonConverter(DataConverter[Union[dict, str]]):
             return s.startswith('{') and s.endswith('}') and '"payload":' in s
         return False
 
-    def convert(self, data: Union[dict, str]) -> AIFormat:
+    def convert(self, data: dict | str) -> AIFormat:
         if isinstance(data, str):
             try:
                 data_dict = json.loads(data)
@@ -41,17 +41,15 @@ class MCPJsonConverter(DataConverter[Union[dict, str]]):
         if not payload:
             raise ValueError("MCP data missing 'payload'.")
 
-        # Decode base64 if needed
+        # MCP uses base64 for transporting binary data
         if encoding == "base64":
             try:
                 decoded_bytes = base64.b64decode(payload)
             except Exception as e:
                 raise ValueError(f"Failed to decode base64 payload: {e}")
         else:
-            # Assume raw string if not base64
             decoded_bytes = payload.encode("utf-8") if isinstance(payload, str) else payload
 
-        # Parse metadata to determine output type
         try:
             meta = json.loads(metadata_raw) if isinstance(metadata_raw, str) else metadata_raw
         except:
