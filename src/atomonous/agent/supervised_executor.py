@@ -1,7 +1,11 @@
 import ast
+from functools import wraps
 
 from smolagents import LocalPythonExecutor
+from PIL import Image
+
 from atomonous.config import settings
+from atomonous.data.factory import ConverterFactory
 
 class SupervisedExecutor(LocalPythonExecutor):
     """
@@ -10,8 +14,10 @@ class SupervisedExecutor(LocalPythonExecutor):
     ensure it is making reasonable decisions before allowing it to execute actions.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, data_factory: ConverterFactory | None = None, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.data_factory = data_factory
+        self.intercepted_artifacts = []
 
         self.user_prompt = "Please provide input: "
         self.confirmation_prompt = "Do you want to proceed? (y/n): "
@@ -85,7 +91,45 @@ class SupervisedExecutor(LocalPythonExecutor):
     def __call__(self, code_action):
         """
         Execute code actions with per-tool approval, unless autorun is enabled.
+        Automatically converts tool outputs using the data factory if present.
         """
+        if self.data_factory:
+            self.intercepted_artifacts = [] # Reset for new code action
+            static_tools = self.static_tools or {}
+            for name, tool in static_tools.items():
+                if hasattr(tool, "_is_atomonous_wrapped"):
+                    continue
+                
+                def generate_wrapper(original_func):
+                    @wraps(original_func)
+                    def wrapped(*args, **kwargs):
+                        try:
+                            raw_result = original_func(*args, **kwargs)
+                        except Exception as e:
+                            # Guarantee a return value to prevent the executor from crashing
+                            raw_result = f"Tool execution finished"
+                            return raw_result
+                            
+                        try:
+                            converted = self.data_factory.convert(raw_result)
+                            if isinstance(converted, Image.Image):
+                                self.intercepted_artifacts.append(converted)
+                            return converted
+                        except Exception:
+                            return raw_result
+                    return wrapped
+
+                if hasattr(tool, "forward"):
+                    tool.forward = generate_wrapper(tool.forward)
+                elif callable(tool):
+                    tool = generate_wrapper(tool)
+                    static_tools[name] = tool
+                
+                try:
+                    setattr(tool, "_is_atomonous_wrapped", True)
+                except (AttributeError, TypeError):
+                    pass
+
         if not self._is_autorun_enabled():
             called_tools = self._get_called_tool_names(code_action)
             for func in called_tools:
@@ -95,4 +139,6 @@ class SupervisedExecutor(LocalPythonExecutor):
                     print(msg)
                     return msg
 
-        return super().__call__(code_action)
+        result = super().__call__(code_action)
+        self.last_output = result
+        return result

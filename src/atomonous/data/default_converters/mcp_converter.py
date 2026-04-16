@@ -1,8 +1,13 @@
 import json
+import re
 import base64
 import io
 from typing import List, Dict, Any, Type
+
 from PIL import Image
+
+import numpy as np
+
 from ..converters import DataConverter, HeuristicMismatchError
 from ..types import AIFormat
 
@@ -21,16 +26,26 @@ class MCPJsonConverter(DataConverter[dict | str]):
             return "payload" in data and "metadata" in data
         if isinstance(data, str):
             # Check if it looks like JSON
-            s = data.strip()
-            return s.startswith('{') and s.endswith('}') and '"payload":' in s
+            try:
+                self._get_json(data)
+                return True
+            except ValueError:
+                return False
         return False
+    
+    def _get_json(self, raw: str) -> dict:
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+
+        if match:
+            json_str = match.group(0)
+            data = json.loads(json_str)
+            return data
+        else:
+            raise ValueError("No JSON found")
 
     def convert(self, data: dict | str) -> AIFormat:
         if isinstance(data, str):
-            try:
-                data_dict = json.loads(data)
-            except Exception as e:
-                raise HeuristicMismatchError(f"Failed to parse MCP JSON string: {e}")
+            data_dict = self._get_json(data)
         else:
             data_dict = data
 
@@ -50,10 +65,7 @@ class MCPJsonConverter(DataConverter[dict | str]):
         else:
             decoded_bytes = payload.encode("utf-8") if isinstance(payload, str) else payload
 
-        try:
-            meta = json.loads(metadata_raw) if isinstance(metadata_raw, str) else metadata_raw
-        except:
-             meta = {}
+        meta = metadata_raw if isinstance(metadata_raw, dict) else json.loads(metadata_raw)
 
         # Heuristics for Image vs Text
         is_image = False
@@ -66,10 +78,27 @@ class MCPJsonConverter(DataConverter[dict | str]):
 
         if is_image:
             try:
-                return Image.open(io.BytesIO(decoded_bytes))
-            except Exception as e:
-                # Fallback to string if image open fails
-                pass
+                dtype = meta.get("dtype", "float32")
+                shape = meta.get("shape")
+                
+                if shape:
+                    image_array = np.frombuffer(decoded_bytes, dtype=dtype).reshape(shape)
+                    image_array = image_array.T
+                    
+                    # Normalize for AI vision (0-255 uint8)
+                    img_min, img_max = image_array.min(), image_array.max()
+                    if img_max > img_min:
+                        normalized = (image_array - img_min) / (img_max - img_min) * 255
+                    else:
+                        normalized = image_array * 0
+                    
+                    return Image.fromarray(normalized.astype(np.uint8))
+            except Exception:
+                # Fallback to PIL.Image.open for standard formats (PNG/JPG)
+                try:
+                    return Image.open(io.BytesIO(decoded_bytes))
+                except Exception:
+                    pass
         
         # Default to string
         try:
