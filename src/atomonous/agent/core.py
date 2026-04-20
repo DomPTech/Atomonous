@@ -1,4 +1,6 @@
 import sys
+import warnings
+import re
 from pathlib import Path
 from typing import Optional, Union, Any, Generator, Self
 from datetime import datetime
@@ -19,8 +21,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 import torch
 import numpy as np
 import yaml
-from smolagents import CodeAgent, TransformersModel, PlanningStep, ActionStep, Model, LiteLLMModel, MCPClient, FinalAnswerStep
-from smolagents.models import ChatMessageStreamDelta, ChatMessage
+from smolagents import CodeAgent, TransformersModel, ActionStep, Model, LiteLLMModel, MCPClient, Tool
 import litellm
 
 from atomonous.utils.helpers import get_total_ram_gb
@@ -30,10 +31,10 @@ from atomonous.agent.supervised_executor import SupervisedExecutor
 from atomonous.config import settings
 from atomonous.data.factory import ConverterFactory
 
-
 class Agent:
     def __init__(self, model: Model, session_name: str = "", data_factory: Optional[ConverterFactory] = None):
         self.model = model
+        self.mcp_clients = []
 
         # Initialize session memory
         self.memory = SessionMemory(
@@ -46,12 +47,8 @@ class Agent:
         else:
             self.data_factory = data_factory
 
-        # Initialize MCP Client
-        self.mcp_client = MCPClient({"url": settings.mcp_url, "transport": "streamable-http"}, structured_output=False)
-        mcp_tools = self.mcp_client.get_tools()
-
         self.agent = CodeAgent(
-            tools=mcp_tools, 
+            tools=[], 
             model=self.model,
             max_steps=settings.agent_max_steps,
             step_callbacks={ActionStep : self._process_step},
@@ -76,11 +73,51 @@ class Agent:
 
         self._setup_executor_context()
     
+    @property
+    def tools(self) -> list[Tool]:
+        return list(self.agent.tools.values())
+
+    def disconnect_mcp_clients(self):
+        """Disconnects all initialized MCP clients."""
+        for client in self.mcp_clients:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+        self.mcp_clients.clear()
+
+    def __del__(self):
+        self.disconnect_mcp_clients()
+
+    def connect_mcp_client(self, server_parameters: dict[str, Any] | None = None, adapter_kwargs: Optional[dict] = None, structured_output: bool = False):
+        """
+        Connects an MCP client to the specified server parameters and adds its tools to the CodeAgent.
+        `server_parameters` can be a dictionary mapping (e.g. {"url": "...", "transport": "streamable-http"})
+        or a list of such dictionaries for connecting multiple servers.
+        If `server_parameters` is None, it will default to connecting to the server specified in the `settings.mcp_url`.
+        """
+        if server_parameters is None:
+            server_parameters = {"url": settings.mcp_url, "transport": "streamable-http"}
+
+        try:
+            client = MCPClient(
+                server_parameters=server_parameters,
+                adapter_kwargs=adapter_kwargs,
+                structured_output=structured_output
+            )
+            self.mcp_clients.append(client)
+            
+            # Add all the fetched tools
+            for tool in client.get_tools():
+                if tool.name not in self.agent.tools.keys():
+                    self.agent.tools[tool.name] = tool
+        except ModuleNotFoundError:
+            warnings.warn("Failed to initialize MCPClient. Ensure `smolagents[mcp]` is installed.")
+            
     @classmethod
     def from_model_id(cls, model_id: str = "Auto", session_name: str = "", data_factory: Optional[ConverterFactory] = None) -> Self:
         model_size_b = 0
         try:
-            import re
             size_match = re.search(r'(\d+\.?\d*)B', model_id)
             if size_match:
                 model_size_b = float(size_match.group(1))
