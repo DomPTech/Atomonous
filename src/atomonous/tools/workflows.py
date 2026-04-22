@@ -98,7 +98,8 @@ class CodeNode(WorkflowNode):
                 
                 # Run as subagent with workflow-construction tools disabled
                 disallowed = ["design_workflow", "execute_workflow"]
-                result = agent.run_subagent(prompt, disallowed_tools=disallowed)
+                # TODO: In the future, use dedicated subagent.
+                result = agent.chat(prompt)
                 
                 state.data[self.name] = result
                 print(f"  -> Agent completed CodeNode task. Response:\n{result}")

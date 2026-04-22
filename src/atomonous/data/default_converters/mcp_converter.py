@@ -27,8 +27,8 @@ class MCPJsonConverter(DataConverter[dict | str]):
         if isinstance(data, str):
             # Check if it looks like JSON
             try:
-                self._get_json(data)
-                return True
+                parsed = self._get_json(data)
+                return "payload" in parsed and "metadata" in parsed
             except ValueError:
                 return False
         return False

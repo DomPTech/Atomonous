@@ -111,6 +111,8 @@ class Agent:
             for tool in client.get_tools():
                 if tool.name not in self.agent.tools.keys():
                     self.agent.tools[tool.name] = tool
+                else:
+                    warnings.warn(f"Tool name conflict: '{tool.name}' already exists in the agent's tools. Skipping this tool from MCP client.")
         except ModuleNotFoundError:
             warnings.warn("Failed to initialize MCPClient. Ensure `smolagents[mcp]` is installed.")
             

@@ -56,8 +56,8 @@ class ConverterFactory:
         candidates = [c for c in self._converters if c.can_handle(data)]
 
         if not candidates:
-             type_name = type(data).__name__
-             raise ValueError(f"No converter found for input type '{type_name}'")
+            type_name = type(data).__name__
+            raise ValueError(f"No converter found for input type '{type_name}'")
 
         # Try each candidate until one succeeds
         last_error = None

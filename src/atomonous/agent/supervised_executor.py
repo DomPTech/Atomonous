@@ -105,10 +105,14 @@ class SupervisedExecutor(LocalPythonExecutor):
                     def wrapped(*args, **kwargs):
                         try:
                             raw_result = original_func(*args, **kwargs)
+                            if raw_result is None:
+                                raw_result = "Tool execution finished"
                         except Exception as e:
-                            # Guarantee a return value to prevent the executor from crashing
-                            raw_result = f"Tool execution finished"
-                            return raw_result
+                            if "returned an empty content" in str(e):
+                                # Guarantee a return value for functions that return empty content
+                                raw_result = "Tool execution finished"
+                                return raw_result
+                            raise
                             
                         try:
                             converted = self.data_factory.convert(raw_result)
