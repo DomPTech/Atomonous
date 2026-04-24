@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List, Any
-
+from PIL import Image
 
 class SessionMemory:
     """
@@ -134,6 +134,30 @@ class SessionMemory:
         if source != dest_path:
             shutil.copy2(source, dest_path)
         print(f"[SessionMemory] Saved image: {dest_path}")
+        
+        return str(dest_path)
+
+    def save_pil_image(self, image: Image.Image, description: str = "") -> str:
+        """
+        Saves a PIL Image to the session directory as a PNG.
+        
+        Args:
+            image: PIL Image object.
+            description: Optional description for the image (used in filename).
+            
+        Returns:
+            Absolute path to the saved image in the session folder.
+        """
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        if description:
+            desc_clean = "".join(c if c.isalnum() or c in "-_" else "_" for c in description.strip()).lower()[:40]
+            filename = f"image_{desc_clean}_{timestamp}.png"
+        else:
+            filename = f"image_{timestamp}.png"
+            
+        dest_path = (self.session_dir / filename).resolve()
+        image.save(dest_path)
+        print(f"[SessionMemory] Saved PIL image: {dest_path}")
         
         return str(dest_path)
 

@@ -206,10 +206,14 @@ class Agent:
         has_new_images = False
         if hasattr(agent.python_executor, "intercepted_artifacts"):
             for artifact in agent.python_executor.intercepted_artifacts:
-                # flatten_messages_as_text is a flag that indicates whether the model supports vision
-                if isinstance(artifact, Image.Image) and not agent.model.flatten_messages_as_text:
-                    step.observations_images = (step.observations_images or []) + [artifact]
-                    has_new_images = True
+                if isinstance(artifact, Image.Image):
+                    # Save image to artifact session folder
+                    self.memory.save_pil_image(artifact, description=f"step_{step.step_number}")
+                    
+                    # Add to observations only if the model supports vision
+                    if not agent.model.flatten_messages_as_text:
+                        step.observations_images = (step.observations_images or []) + [artifact]
+                        has_new_images = True
             
             agent.python_executor.intercepted_artifacts = []
 
