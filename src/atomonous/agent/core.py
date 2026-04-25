@@ -21,7 +21,9 @@ if str(_PROJECT_ROOT) not in sys.path:
 import torch
 import numpy as np
 import yaml
+
 from smolagents import CodeAgent, TransformersModel, ActionStep, Model, LiteLLMModel, MCPClient, Tool
+from smolagents.models import REMOVE_PARAMETER
 import litellm
 
 from atomonous.utils.helpers import get_total_ram_gb
@@ -170,7 +172,12 @@ class Agent:
 
     @classmethod
     def from_api_key(cls, model_id: str, api_base: str, api_key: str, session_name: str = "", data_factory: Optional[ConverterFactory] = None) -> Self:
-        model = LiteLLMModel(model_id=model_id, api_base=api_base, api_key=api_key)
+        model = LiteLLMModel(
+            model_id=model_id,
+            api_base=api_base,
+            api_key=api_key,
+            stop=REMOVE_PARAMETER
+        )
         model.flatten_messages_as_text = not litellm.supports_vision(model_id)
         return cls(model=model, session_name=session_name, data_factory=data_factory)
 

@@ -27,6 +27,11 @@ dependencies = [
     "torch",
 ]
 
+[project.optional-dependencies]
+serving = [
+    "transformers[serving]>=4.57.6",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["atomonous*"]
