@@ -22,7 +22,8 @@ import torch
 import numpy as np
 import yaml
 
-from smolagents import CodeAgent, TransformersModel, ActionStep, Model, LiteLLMModel, MCPClient, Tool
+from smolagents import CodeAgent, TransformersModel, ActionStep, Model, LiteLLMModel, Tool
+from atomonous.agent.mcp_client import ExtendedMCPClient
 import litellm
 
 from atomonous.utils.helpers import get_total_ram_gb
@@ -102,10 +103,10 @@ class Agent:
             server_parameters = {"url": settings.mcp_url, "transport": "streamable-http"}
 
         try:
-            client = MCPClient(
+            client = ExtendedMCPClient(
                 server_parameters=server_parameters,
                 adapter_kwargs=adapter_kwargs,
-                structured_output=structured_output
+                structured_output=structured_output,
             )
             self.mcp_clients.append(client)
             
@@ -116,7 +117,7 @@ class Agent:
                 else:
                     warnings.warn(f"Tool name conflict: '{tool.name}' already exists in the agent's tools. Skipping this tool from MCP client.")
         except ModuleNotFoundError:
-            warnings.warn("Failed to initialize MCPClient. Ensure `smolagents[mcp]` is installed.")
+            warnings.warn("Failed to initialize ExtendedMCPClient. Ensure `smolagents[mcp]` is installed.")
             
     @classmethod
     def from_model_id(cls, model_id: str = "Auto", session_name: str = "", data_factory: Optional[ConverterFactory] = None) -> Self:
